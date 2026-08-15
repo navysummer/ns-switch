@@ -15,6 +15,7 @@ pub enum ConfigKind {
     JsonEnv,
     CodexToml,
     TomlEnv,
+    YamlEnv,
 }
 
 pub fn tools() -> Vec<ToolDef> {
@@ -26,7 +27,7 @@ pub fn tools() -> Vec<ToolDef> {
         ToolDef { id: "grok", name: "Grok Build", kind: ConfigKind::TomlEnv },
         ToolDef { id: "opencode", name: "OpenCode", kind: ConfigKind::JsonEnv },
         ToolDef { id: "openclaw", name: "OpenClaw", kind: ConfigKind::JsonEnv },
-        ToolDef { id: "hermes", name: "Hermes Agent", kind: ConfigKind::JsonEnv },
+        ToolDef { id: "hermes", name: "Hermes Agent", kind: ConfigKind::YamlEnv },
     ]
 }
 
@@ -44,7 +45,7 @@ pub fn config_path(tool_id: &str) -> Option<PathBuf> {
         "grok" => Some(home.join(".grok").join("config.toml")),
         "opencode" => Some(home.join(".config").join("opencode").join("opencode.json")),
         "openclaw" => Some(home.join(".openclaw").join("openclaw.json")),
-        "hermes" => Some(home.join(".hermes").join("settings.json")),
+        "hermes" => Some(home.join(".hermes").join("config.yaml")),
         _ => None,
     }
 }
@@ -109,6 +110,7 @@ pub fn switch_provider_to(tool_id: &str, p: &Provider) -> Result<(), String> {
         ConfigKind::JsonEnv => write_json_env(&path, tool_id, p),
         ConfigKind::CodexToml => write_codex_toml(&path, p),
         ConfigKind::TomlEnv => write_toml_env(&path, tool_id, p),
+        ConfigKind::YamlEnv => write_yaml_env(&path, tool_id, p),
     }
 }
 
@@ -249,6 +251,22 @@ fn write_toml_env(path: &PathBuf, tool_id: &str, p: &Provider) -> Result<(), Str
     atomic_write_text(path, &toml::to_string(&toml::Value::Table(root)).map_err(|e| e.to_string())?)
 }
 
+fn write_yaml_env(path: &PathBuf, tool_id: &str, p: &Provider) -> Result<(), String> {
+    let plan = env_plan(tool_id).ok_or("unsupported env plan")?;
+    let mut lines: Vec<String> = Vec::new();
+    let push = |lines: &mut Vec<String>, key: &str, val: &str| {
+        if !key.is_empty() {
+            lines.push(format!("{key}: \"{}\"", val.replace('"', "\\\"")));
+        }
+    };
+    push(&mut lines, plan.0, &p.base_url);
+    push(&mut lines, plan.1, &p.api_key);
+    if !plan.2.is_empty() {
+        push(&mut lines, plan.2, &p.model);
+    }
+    atomic_write_text(path, &format!("{}\n", lines.join("\n")))
+}
+
 pub fn atomic_write_json(path: &PathBuf, val: &serde_json::Map<String, Value>) -> Result<(), String> {
     let body = serde_json::to_string_pretty(&Value::Object(val.clone())).map_err(|e| e.to_string())?;
     atomic_write_text(path, &format!("{body}\n"))
@@ -356,6 +374,7 @@ pub fn write_mcp_to_tool(tool_id: &str, servers: &[McpServer]) -> Result<bool, S
             atomic_write_text(&path, &toml::to_string(&toml::Value::Table(root)).map_err(|e| e.to_string())?)?;
             Ok(true)
         }
+        Some(ConfigKind::YamlEnv) => Ok(false),
         None => Ok(false),
     }
 }
@@ -417,6 +436,22 @@ pub fn reset_config(tool_id: &str) -> Result<(), String> {
             }
             atomic_write_text(&path, &toml::to_string(&toml::Value::Table(root)).map_err(|e| e.to_string())?)
         }
+        Some(ConfigKind::YamlEnv) => {
+            let plan = match env_plan(tool_id) {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let src = fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<String> = src.lines().filter(|l| {
+                let trimmed = l.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    return true;
+                }
+                let key = trimmed.split(':').next().unwrap_or("").trim();
+                !(key == plan.0 || key == plan.1 || key == plan.2)
+            }).map(|l| l.to_string()).collect();
+atomic_write_text(&path, &format!("{}\n", lines.join("\n")))
+        }
         None => Ok(()),
     }
 }
@@ -459,6 +494,7 @@ pub fn read_mcp_from_config(
                 out.push((name, (command, args, env, cwd, transport, active)));
             }
         }
+        Some(ConfigKind::YamlEnv) => {}
         None => {}
     }
     out
@@ -571,6 +607,31 @@ pub fn read_existing_config(tool_id: &str) -> (String, String, String) {
             let base = get(plan.0);
             let key = get(plan.1);
             let model = get(plan.2);
+            if base.is_empty() && key.is_empty() && model.is_empty() {
+                empty
+            } else {
+                (base, key, model)
+            }
+        }
+        Some(ConfigKind::YamlEnv) => {
+            let plan = match env_plan(tool_id) {
+                Some(p) => p,
+                None => return empty,
+            };
+            let Ok(src) = fs::read_to_string(&path) else { return empty };
+            let mut base = String::new();
+            let mut key = String::new();
+            let mut model = String::new();
+            for line in src.lines() {
+                let trimmed = line.trim();
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    let k = k.trim();
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if k == plan.0 { base = v.to_string(); }
+                    if k == plan.1 { key = v.to_string(); }
+                    if !plan.2.is_empty() && k == plan.2 { model = v.to_string(); }
+                }
+            }
             if base.is_empty() && key.is_empty() && model.is_empty() {
                 empty
             } else {
