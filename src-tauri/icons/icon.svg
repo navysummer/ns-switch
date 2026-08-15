@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="50%" stop-color="#16213e"/>
+      <stop offset="100%" stop-color="#0f3460"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4a90d9"/>
+      <stop offset="50%" stop-color="#357abd"/>
+      <stop offset="100%" stop-color="#2a6cb8"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00d4ff"/>
+      <stop offset="100%" stop-color="#0099cc"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#00d4ff" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+    <filter id="glowFilter">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="248" fill="url(#bg)" filter="url(#shadow)"/>
+
+  <!-- Subtle inner glow -->
+  <circle cx="256" cy="256" r="248" fill="url(#glow)" opacity="0.4"/>
+
+  <!-- Shield shape -->
+  <path d="M256 80 L400 140 L400 260 C400 340 340 400 256 430 C172 400 112 340 112 260 L112 140 Z"
+        fill="url(#shield)" opacity="0.9" stroke="url(#accent)" stroke-width="2"/>
+
+  <!-- Shield highlight -->
+  <path d="M256 90 L388 146 L388 258 C388 332 332 390 256 418 C180 390 124 332 124 258 L124 146 Z"
+        fill="none" stroke="url(#accent)" stroke-width="1.5" opacity="0.4"/>
+
+  <!-- Network node: central dot -->
+  <circle cx="256" cy="240" r="18" fill="url(#accent)" filter="url(#glowFilter)"/>
+
+  <!-- Network node: satellite dots -->
+  <circle cx="256" cy="180" r="8" fill="#00d4ff" opacity="0.8"/>
+  <circle cx="210" cy="270" r="8" fill="#00d4ff" opacity="0.8"/>
+  <circle cx="302" cy="270" r="8" fill="#00d4ff" opacity="0.8"/>
+
+  <!-- Connection lines -->
+  <line x1="248" y1="228" x2="220" y2="190" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+  <line x1="264" y1="228" x2="292" y2="190" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+  <line x1="246" y1="252" x2="218" y2="268" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+  <line x1="266" y1="252" x2="294" y2="268" stroke="#00d4ff" stroke-width="2" opacity="0.6"/>
+
+  <!-- Data flow arrows (small triangles on lines) -->
+  <polygon points="224,196 220,190 228,190" fill="#00d4ff" opacity="0.8"/>
+  <polygon points="288,196 284,190 292,190" fill="#00d4ff" opacity="0.8"/>
+  <polygon points="224,262 218,266 218,258" fill="#00d4ff" opacity="0.8"/>
+  <polygon points="288,262 294,266 294,258" fill="#00d4ff" opacity="0.8"/>
+
+  <!-- NS text -->
+  <text x="256" y="340" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="52" font-weight="700" fill="white" text-anchor="middle" letter-spacing="8">
+    NS
+  </text>
+
+  <!-- Small decorative dots on shield top -->
+  <circle cx="220" cy="145" r="3" fill="#00d4ff" opacity="0.5"/>
+  <circle cx="256" cy="135" r="3" fill="#00d4ff" opacity="0.7"/>
+  <circle cx="292" cy="145" r="3" fill="#00d4ff" opacity="0.5"/>
+
+  <!-- Outer ring decorations -->
+  <circle cx="256" cy="256" r="230" fill="none" stroke="url(#accent)" stroke-width="0.5" opacity="0.2"/>
+  <circle cx="256" cy="256" r="210" fill="none" stroke="url(#accent)" stroke-width="0.5" opacity="0.15"/>
+</svg>
