@@ -6,6 +6,13 @@ members = [
     "crates/ns-store",
     "crates/ns-live",
     "crates/ns-presets",
+    "crates/ns-proxy",
+    "crates/ns-mcp",
+    "crates/ns-skills",
+    "crates/ns-prompts",
+    "crates/ns-usage",
+    "crates/ns-sessions",
+    "crates/ns-tools",
 ]
 
 [workspace.package]
@@ -21,11 +28,20 @@ gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+serde_json_lenient = { version = "0.2", features = ["preserve_order"] }
+toml_edit = "0.22"
 
 ns-ui = { path = "crates/ns-ui" }
 ns-store = { path = "crates/ns-store" }
 ns-live = { path = "crates/ns-live" }
 ns-presets = { path = "crates/ns-presets" }
+ns-proxy = { path = "crates/ns-proxy" }
+ns-mcp = { path = "crates/ns-mcp" }
+ns-skills = { path = "crates/ns-skills" }
+ns-prompts = { path = "crates/ns-prompts" }
+ns-usage = { path = "crates/ns-usage" }
+ns-sessions = { path = "crates/ns-sessions" }
+ns-tools = { path = "crates/ns-tools" }
 
 [profile.dev]
 opt-level = 1

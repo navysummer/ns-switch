@@ -15,5 +15,16 @@ ns-ui.workspace = true
 ns-store.workspace = true
 ns-live.workspace = true
 ns-presets.workspace = true
+ns-proxy.workspace = true
+ns-mcp.workspace = true
+ns-skills.workspace = true
+ns-prompts.workspace = true
+ns-usage.workspace = true
+ns-sessions.workspace = true
+ns-tools.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tray-icon = "0.26"
+muda = "0.21"
 serde.workspace = true
 serde_json.workspace = true
+unicode-segmentation = "1"

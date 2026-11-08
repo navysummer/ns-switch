@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// 支持的客户端工具。`Switch` 类同一时刻只有一个在用供应商；
 /// `Coexist` 类把多个供应商写入工具自身配置，工具内再选。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tool {
     Claude,
@@ -98,6 +98,32 @@ impl Tool {
     pub fn supports_aggregation(self) -> bool {
         matches!(self, Tool::Claude | Tool::Codex)
     }
+
+    /// 切换后是否需要重启终端/进程：
+    /// Claude Code 每次命令读取 settings.json（热切换）；
+    /// Codex/Gemini/Grok 等在运行中的会话可能缓存配置。
+    pub fn needs_restart(self) -> bool {
+        !matches!(self, Tool::Claude | Tool::ClaudeDesktop)
+    }
+
+    /// 序列化用的 kebab-case id（与 `template_type` 一致）。
+    pub fn id_str(self) -> &'static str {
+        match self {
+            Tool::Claude => "claude",
+            Tool::ClaudeDesktop => "claude-desktop",
+            Tool::Codex => "codex",
+            Tool::Gemini => "gemini",
+            Tool::GrokBuild => "grokbuild",
+            Tool::Opencode => "opencode",
+            Tool::Openclaw => "openclaw",
+            Tool::Hermes => "hermes",
+            Tool::Pi => "pi",
+            Tool::Mcode => "mcode",
+            Tool::Kimi => "kimi",
+            Tool::Agy => "agy",
+            Tool::Omp => "omp",
+        }
+    }
 }
 
 /// 供应商分类（差异化提示/能力开关）。
@@ -137,5 +163,20 @@ impl ProviderCategory {
             ProviderCategory::Omo => "OMO",
             ProviderCategory::OmoSlim => "OMO Slim",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_hot_switches_others_restart() {
+        assert!(!Tool::Claude.needs_restart(), "Claude Code 热切换");
+        assert!(!Tool::ClaudeDesktop.needs_restart());
+        assert!(Tool::Codex.needs_restart());
+        assert!(Tool::Gemini.needs_restart());
+        assert!(Tool::GrokBuild.needs_restart());
+        assert!(Tool::Opencode.needs_restart());
     }
 }

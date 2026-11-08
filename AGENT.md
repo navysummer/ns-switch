@@ -196,6 +196,7 @@
 - 选择同步目标（Claude Code / Codex / Gemini CLI / Grok Build / OpenCode / Hermes / Pi / MiniMax Code / Kimi Code / Oh My Pi）。
 - 从各工具导入既有配置、Deep Link 导入。
 - 增删/启用禁用、搜索、跨工具启用/禁用全部。
+- **已实现**（`ns-mcp` crate + MCP 页）：统一 `McpServer` 模型、Claude/Codex/Gemini 读写适配器（保注释/键序）、跨工具同步与导入；UI 支持增删/编辑/启停/同步。
 
 ### F6 Skills 管理
 
@@ -203,12 +204,14 @@
 - 检查更新、一键全部更新。
 - 同步策略：自动 / 仅符号链接 / 仅复制；可选存 `~/.agents/skills`。
 - 每工具启用/禁用全部。
+- **已实现**（`ns-skills` crate + Skills 页）：统一 `Skill` 模型、Claude/Codex/Gemini 目录读写（`SKILL.md` 前端 YAML）、GitHub/本地安装、跨工具同步；UI 支持增删/编辑/安装。
 
 ### F7 Prompts 管理
 
 - 每工具提示词库 + Markdown 编辑器。
 - 启用写回该工具提示文件（CLAUDE.md / AGENTS.md / GEMINI.md）；写回前先把文件既有内容存回库，不丢失。
 - Pi 可编辑 SYSTEM.md / APPEND_SYSTEM.md / 提示词模板。
+- **已实现**（`ns-prompts` crate + Prompts 页）：统一 `PromptEntry` 模型、独立 `prompts.json` 库、Claude/Codex/Gemini 提示文件写回（先回存既有内容再合并写回）；UI 支持增删/编辑/启停/写回。
 
 ### F8 用量统计
 
@@ -292,12 +295,15 @@
 ✅ 已实现并验证：
 
 - **M0 脚手架**：Cargo 工作区（ns-switch bin + ns-ui/ns-store/ns-live/ns-presets）、GPUI 主窗口、暖墨金主题令牌（移植 ns-embed-ide theme.rs）、通用组件（品牌徽标/主按钮/幽灵按钮/胶囊/状态点）、侧栏（13 工具列表、切换/共存徽章、9 页面切换）、顶栏（品牌 + 添加供应商）、供应商页（卡片列表 + 空态 + 欢迎页）、状态栏（状态点/当前工具/版本）；`cargo check --workspace` 0 警告 0 错误，`cargo test --workspace` 14 用例全绿，`target/debug/ns-switch` 启动不崩溃。
-- **M1 存储与预设（切片）**：`ns-store` —— `~/.ns-switch/config.json` SSOT 读写（原子写临时文件 + rename）、损坏回退（备份 `.corrupt-<ts>` 后回默认）、供应商 CRUD、当前选择、设置；`ns-presets` —— 工具枚举（13 工具，切换/共存/路由/聚合能力）、供应商数据模型（SSOT 模式）、供应商分类、预设表（Claude Code/Codex/Gemini CLI 首批 17 个：官方 + 88API/OpenRouter/PPIO/AIGoCode/CCSub/SiliconFlow/Ollama/Fenno 等）、搜索（名称/别名/域名）、供应商 → settingsConfig 关键字段生成模板；`ns-live` —— Claude Code `env` 地板清单（前缀/命名键/协议选择器/`CLAUDE_CODE_SKIP_*_AUTH`）。
+- **M1 存储与预设**：`ns-store` —— `~/.ns-switch/config.json` SSOT 读写（原子写临时文件 + rename）、损坏回退（备份 `.corrupt-<ts>` 后回默认）、供应商 CRUD、当前选择、设置；`ns-presets` —— 工具枚举（13 工具，切换/共存/路由/聚合能力）、供应商数据模型（SSOT 模式）、供应商分类、预设表（Claude Code/Codex/Gemini CLI 首批 17 个：官方 + 88API/OpenRouter/PPIO/AIGoCode/CCSub/SiliconFlow/Ollama/Fenno 等）、搜索（名称/别名/域名）、供应商 → settingsConfig 关键字段生成模板。
+- **M2 切换引擎**：`ns-live` —— Claude Code `env` 地板清单、Codex `auth/config` 地板、Gemini `env` 地板；供应商 → 目标值投影（`claude_patch`/`codex_patch`/`gemini_settings_patch`/`gemini_env_entries`）；保序补丁引擎（JSONC 保留缩进/注释/键序、TOML 保留注释/键序、`.env` 逐行保序）；首写备份（去重 `.source` 标记）+ 应用写锁（不可重入）+ 原子写 + 写后重读比对。
+- **M3 界面·供应商**：供应商卡片（图标/名称/当前标记/状态徽章/操作菜单：编辑/复制/导出/删除）、添加对话框（预设搜索 + endpoint/key/model 表单 + 配置预览 + 保存）、编辑对话框（预填 `from_provider`、标题切「编辑供应商」、保存走更新分支）、删除确认浮层（当前激活须先切走才可删）、供应商搜索框、拖拽排序（`sortIndex` 写回）、导入/导出 JSON（系统文件对话框 + 校验）。
+- **M4 切换集成**：界面一键切换（卡片「切换」按钮 → `switch_to`：写 live 文件 + 更新 `current`）、写入前冲突检测（目标 live 文件被手动改动/他方占用 → 告警 + 首写备份覆盖）、切换后提示（Claude Code 热切换；Codex/Gemini/Grok 需重启终端）、端到端验证（真实切换 B→A 核对 settings.json 内容、重复切换 noop、首写备份保留原始）。
 
 🚧 未完成（不得声称已实现）：
 
-- **M1 其余**：预设表扩至 90+（其余工具）、供应商卡片真实数据渲染接线、导入导出 UI。
-- **M2–M12**：M2 切换引擎其余（Codex/Gemini 地板、投影、补丁引擎、首写备份、写锁）、M3 界面·供应商其余（对话框/搜索/排序/导入导出）、M4 切换集成、M5 本地路由、M6 托盘、M7 MCP/Skills/Prompts、M8 聚合、M9 用量、M10 会话、M11 工具/项目/账号、M12 辅助与体验 —— 均未开始，不得声称已实现。
+- **M1 其余**：预设表扩至 90+（其余工具）。
+- **M5–M12**：M5 本地路由（ns-proxy）、M6 托盘、M7 MCP/Skills/Prompts、M8 聚合模式、M9 用量统计、M10 会话管理、M11 工具/项目/账号、M12 辅助与体验 —— 均未开始，不得声称已实现。
 
 ---
 
