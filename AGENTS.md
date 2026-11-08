@@ -33,7 +33,7 @@
 1. **零警告、零错误**：`cargo check --workspace` 必须 0 警告、0 错误，`cargo build` 可通过，`cargo test --workspace` 全绿。禁止用 `#[allow(dead_code)]` 等属性掩盖本项目的警告；未使用的代码必须真正接入界面/逻辑，否则删除。
 2. **完整实现**：规格列出的功能必须真实、完整实现并验证。禁止用 `unimplemented!()`/`todo!()`/空函数体/硬编码返回值冒充完成；禁止界面控件"存在但点击无反应"；禁止以"预留/后续再做"交付核心路径。无法在当前迭代完成的能力必须明确标注**未完成**，列出缺口与验收方式。
 3. **交付即验证**：提交前本机实际运行（`cargo check/build/test` + 启动应用走通关键路径 + 真实切换一次供应商并核对客户端配置文件）；UI 改动尽量截图核对。
-4. **文档同步**：`AGENT.md` / `README.md` 的范围与完成状态必须与代码一致。
+4. **文档同步**：`AGENTS.md` / `README.md` 的范围与完成状态必须与代码一致。
 
 ---
 
@@ -403,4 +403,4 @@
 
 - cc-switch 后端：`src-tauri/src/{config,provider,live,proxy,mode}.rs`、`live/{floor,project,patch,engine}.rs`。
 - cc-switch 前端：`src/components/providers/`、`src/components/shell/`、`src/config/*Presets.ts`、`src/types.ts`。
-- 界面风格：`ns-embed-ide/crates/ns-ide/src/{theme,widgets}.rs`、`AGENT.md` 第 8 章。
+- 界面风格：`ns-embed-ide/crates/ns-ide/src/{theme,widgets}.rs`、`AGENTS.md` 第 8 章。
