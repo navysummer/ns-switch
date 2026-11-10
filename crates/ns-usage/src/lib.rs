@@ -6,9 +6,13 @@
 //! - **内置模板**：内置的常用供应商端点查询（Claude 订阅配额、Codex 余额等）。
 
 mod pricing;
-pub use pricing::{ModelPrice, cost, model_price};
+pub use pricing::{
+    CustomPrice, ModelPrice, cost, cost_with_custom, import_models_dev, model_price,
+};
 mod session;
 pub use session::*;
+mod gemini;
+pub use gemini::*;
 
 
 use std::path::Path;

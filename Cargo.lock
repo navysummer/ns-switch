@@ -3700,6 +3700,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_lenient",
+ "serde_yaml",
  "toml 0.8.23",
  "toml_edit 0.22.27",
 ]
@@ -3764,9 +3765,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
+ "hex",
+ "hmac",
  "ns-presets",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

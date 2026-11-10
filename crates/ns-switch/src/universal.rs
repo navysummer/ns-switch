@@ -3,7 +3,7 @@
 //! 与 cc-switch `UniversalProvider` 语义一致：`save_universal` 投影子供应商到
 //! `providers`（`universal-claude-<id>` 等），各应用切换时直接写 live。
 
-use gpui::{Context, Div, div, prelude::*, px, rgb};
+use gpui::{Context, Div, div, prelude::*, px};
 use ns_presets::{UniversalApps, UniversalModels};
 use ns_ui::{theme, widgets};
 
@@ -59,9 +59,9 @@ pub fn universal_dialog(
                 .w(px(560.))
                 .max_h(px(640.))
                 .rounded(px(14.))
-                .bg(theme::color(theme::PANEL_SOLID))
+                .bg(theme::panel())
                 .border_1()
-                .border_color(theme::alpha(theme::STROKE, 0.25))
+                .border_color(theme::stroke_a(0.25))
                 .shadow_lg()
                 .flex_col()
                 .child(
@@ -72,12 +72,12 @@ pub fn universal_dialog(
                         .items_center()
                         .justify_between()
                         .border_b_1()
-                        .border_color(theme::alpha(theme::STROKE, 0.12))
+                        .border_color(theme::stroke_a(0.12))
                         .child(
                             div()
                                 .text_size(px(13.))
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(rgb(theme::TEXT))
+                                .text_color(theme::text())
                                 .child(if editing {
                                     "编辑通用供应商"
                                 } else {
@@ -104,7 +104,7 @@ pub fn universal_dialog(
                         .child(field("Base URL", &inputs.base_url))
                         .child(field("API Key", &inputs.api_key))
                         .child(apps_row(form, cx))
-                        .child(div().h(px(1.)).bg(theme::alpha(theme::STROKE, 0.1)))
+                        .child(div().h(px(1.)).bg(theme::stroke_a(0.1)))
                         .child(field("Claude 模型", &inputs.claude_model))
                         .child(field("Codex 模型", &inputs.codex_model))
                         .child(field("Gemini 模型", &inputs.gemini_model)),
@@ -118,7 +118,7 @@ pub fn universal_dialog(
                         .justify_end()
                         .gap(px(10.))
                         .border_t_1()
-                        .border_color(theme::alpha(theme::STROKE, 0.1))
+                        .border_color(theme::stroke_a(0.1))
                         .child(widgets::ghost_button("uni-dlg-cancel", "取消").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.universal_open = false;
@@ -128,7 +128,29 @@ pub fn universal_dialog(
                         .child(
                             widgets::ghost_button("uni-dlg-save", "保存")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    save_universal_from_dialog(this, cx);
+                                    let _ = save_universal_from_dialog(this, cx);
+                                })),
+                        )
+                        .child(
+                            widgets::primary_button("uni-dlg-save-sync", "保存并同步")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let saved_id = save_universal_from_dialog(this, cx);
+                                    if let Some(id) = saved_id {
+                                        let result = {
+                                            let mut store =
+                                                this.store.write().expect("store lock");
+                                            store.sync_universal_children(&id)
+                                        };
+                                        match result {
+                                            Ok(()) => {
+                                                this.status = format!("已保存并同步通用供应商");
+                                            }
+                                            Err(e) => {
+                                                this.status = format!("同步失败: {e}");
+                                            }
+                                        }
+                                        cx.notify();
+                                    }
                                 })),
                         ),
                 ),
@@ -145,7 +167,7 @@ fn apps_row(form: &UniversalForm, cx: &mut Context<crate::app::SwitchApp>) -> Di
         .child(
             div()
                 .text_size(px(11.))
-                .text_color(rgb(theme::TEXT_DIM))
+                .text_color(theme::text_dim())
                 .child("同步到"),
         )
         .children(apps.into_iter().map(|(id, label, checked)| {
@@ -174,9 +196,9 @@ fn apps_row(form: &UniversalForm, cx: &mut Context<crate::app::SwitchApp>) -> Di
                         .size(px(14.))
                         .rounded(px(4.))
                         .border_1()
-                        .border_color(theme::alpha(theme::STROKE, 0.4))
+                        .border_color(theme::stroke_a(0.4))
                         .bg(if checked {
-                            theme::color(theme::ACCENT)
+                            theme::accent()
                         } else {
                             theme::alpha(0xffffff, 0.02)
                         })
@@ -184,7 +206,7 @@ fn apps_row(form: &UniversalForm, cx: &mut Context<crate::app::SwitchApp>) -> Di
                         .items_center()
                         .justify_center()
                         .child(if checked {
-                            div().text_size(px(9.)).text_color(rgb(theme::DARK_TEXT)).child("✓")
+                            div().text_size(px(9.)).text_color(theme::dark_text()).child("✓")
                         } else {
                             div()
                         }),
@@ -192,7 +214,7 @@ fn apps_row(form: &UniversalForm, cx: &mut Context<crate::app::SwitchApp>) -> Di
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(theme::text())
                         .child(label),
                 )
         }))
@@ -213,7 +235,7 @@ fn field(
                 .w(px(110.))
                 .flex_none()
                 .text_size(px(11.))
-                .text_color(rgb(theme::TEXT_DIM))
+                .text_color(theme::text_dim())
                 .child(label),
         )
         .child(
@@ -224,29 +246,29 @@ fn field(
                 .rounded(px(8.))
                 .bg(theme::alpha(0x000000, 0.25))
                 .border_1()
-                .border_color(theme::alpha(theme::STROKE, 0.14))
+                .border_color(theme::stroke_a(0.14))
                 .flex()
                 .items_center()
                 .child(input.clone()),
         )
 }
 
-/// 从对话框输入保存通用供应商。
+/// 从对话框输入保存通用供应商。返回保存成功的 id（保存失败/空输入返回 None）。
 fn save_universal_from_dialog(
     this: &mut crate::app::SwitchApp,
     cx: &mut Context<crate::app::SwitchApp>,
-) {
+) -> Option<String> {
     let name = this.universal_inputs.name.read(cx).text().trim().to_string();
     if name.is_empty() {
         this.status = "通用供应商名称不能为空".into();
         cx.notify();
-        return;
+        return None;
     }
     let base_url = this.universal_inputs.base_url.read(cx).text().trim().to_string();
     if base_url.is_empty() {
         this.status = "Base URL 不能为空".into();
         cx.notify();
-        return;
+        return None;
     }
     let api_key = this.universal_inputs.api_key.read(cx).text().trim().to_string();
     let provider_type = this.universal_inputs.provider_type.read(cx).text().trim().to_string();
@@ -305,10 +327,13 @@ fn save_universal_from_dialog(
             this.status = format!("已保存通用供应商 {id}");
             this.universal_open = false;
             this.universal_edit = None;
+            cx.notify();
+            Some(id)
         }
         Err(e) => {
             this.status = format!("保存失败: {e}");
+            cx.notify();
+            None
         }
     }
-    cx.notify();
 }

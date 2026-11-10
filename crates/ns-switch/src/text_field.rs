@@ -5,7 +5,7 @@ use gpui::{
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     Render, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, actions, div, fill,
-    font, prelude::*, px, relative, rgb, size,
+    font, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -79,6 +79,11 @@ impl TextField {
 
     pub fn text(&self) -> String {
         self.content.to_string()
+    }
+
+    /// 暴露焦点句柄（供父组件聚焦搜索框）。
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
     }
 
     /// 设置文本内容并重置选区（用于编辑对话框预填）。
@@ -325,7 +330,7 @@ impl EntityInputHandler for TextField {
         range_utf16: Option<Range<usize>>,
         new_text: &str,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let range = range_utf16
             .as_ref()
@@ -340,6 +345,8 @@ impl EntityInputHandler for TextField {
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
+        // 普通 ASCII 键入走此路径；不 notify 可能不触发重绘。
+        cx.notify();
     }
 
 
@@ -467,9 +474,9 @@ impl Element for TextElement {
         let placeholder = input.placeholder.clone();
 
         let (display_text, text_color) = if content.is_empty() {
-            (placeholder, theme::color(theme::TEXT_FAINT))
+            (placeholder, theme::text_faint())
         } else {
-            (content, theme::color(theme::TEXT))
+            (content, theme::text())
         };
 
         let font = font(theme::UI_FONT);
@@ -511,7 +518,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    theme::alpha(theme::ACCENT, 0.22),
+                    theme::accent_a(0.22),
                 )),
                 None,
             )
@@ -580,9 +587,9 @@ impl Render for TextField {
             .bg(theme::alpha(0xffebc8, 0.05))
             .border_1()
             .border_color(if focused {
-                theme::alpha(theme::ACCENT, 0.75)
+                theme::accent_a(0.75)
             } else {
-                theme::alpha(theme::STROKE, 0.16)
+                theme::stroke_a(0.16)
             })
             .key_context("TextField")
             .track_focus(&self.focus_handle)
@@ -603,7 +610,7 @@ impl Render for TextField {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .font_family(theme::UI_FONT)
             .text_size(px(13.5))
             .child(TextElement { input: cx.entity() })

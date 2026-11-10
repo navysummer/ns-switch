@@ -25,6 +25,8 @@ pub struct ToolMenuEntry {
     pub routing: bool,
     /// (provider_id, provider_name, is_current)
     pub providers: Vec<(String, String, bool)>,
+    /// 用量摘要（配额/剩余/重置倒计时；None = 无数据）。
+    pub usage_note: Option<String>,
 }
 
 /// 托盘实例（持有图标；菜单由 `TrayIcon` 持有）。
@@ -135,16 +137,22 @@ fn plan_menu(tool_entries: &[ToolMenuEntry]) -> Vec<PlanItem> {
     let summary: Vec<String> = tool_entries
         .iter()
         .filter_map(|e| {
-            e.providers
+            let name = e
+                .providers
                 .iter()
                 .find(|(_, _, is_current)| *is_current)
-                .map(|(_, name, _)| {
-                    if e.routing {
-                        format!("{} → {name}（路由中）", e.tool.label())
-                    } else {
-                        format!("{} → {name}", e.tool.label())
-                    }
-                })
+                .map(|(_, name, _)| name.clone())?;
+            let mut s = if e.routing {
+                format!("{} → {name}（路由中）", e.tool.label())
+            } else {
+                format!("{} → {name}", e.tool.label())
+            };
+            if let Some(note) = &e.usage_note {
+                if !note.is_empty() {
+                    s.push_str(&format!("　{note}"));
+                }
+            }
+            Some(s)
         })
         .collect();
     if !summary.is_empty() {
@@ -263,6 +271,7 @@ mod tests {
                 ("claude-a".into(), "供应商甲".into(), true),
                 ("claude-b".into(), "供应商乙".into(), false),
             ],
+            usage_note: Some("剩 100 · ⏱ 5h00m".into()),
         }];
         let plan = plan_menu(&entries);
         // 摘要头 + 分隔线 + 打开主窗口 + 分隔线 + 子菜单 + 分隔线 + 退出。

@@ -41,6 +41,9 @@ pub fn read_tool(tool: Tool, paths: &SkillPaths) -> Result<Vec<Skill>, String> {
 
 /// 某工具的 skills 根目录。
 pub fn skills_dir(tool: Tool, paths: &SkillPaths) -> PathBuf {
+    if paths.shared {
+        return paths.home.join(".agents").join("skills");
+    }
     match tool {
         Tool::Claude | Tool::ClaudeDesktop => paths.claude_skills(),
         Tool::Codex => paths.codex_skills(),
@@ -75,13 +78,22 @@ fn parse_skill_file(path: &Path) -> Option<Skill> {
                 .collect()
         })
         .unwrap_or_default();
+    let enabled = meta
+        .get("enabled")
+        .and_then(|v| v.as_str())
+        .map(|s| !matches!(s.to_ascii_lowercase().as_str(), "false" | "no" | "0"))
+        .unwrap_or(true);
     Some(Skill {
         name,
         description,
         allowed_tools,
         body,
         source_path: None,
-        enabled: true,
+        repo_url: meta
+            .get("ns-repo-url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        enabled,
     })
 }
 
@@ -98,7 +110,7 @@ fn split_frontmatter(text: &str) -> (serde_json::Map<String, serde_json::Value>,
         return (serde_json::Map::new(), trimmed.to_string());
     }
     let meta_text = &trimmed[4..body_end.unwrap()];
-    let body = trimmed[body_end.unwrap() + 4..].to_string();
+    let body = trimmed[body_end.unwrap() + 5..].to_string();
     // 简单 key: value 解析（前端 YAML 只取标量；复杂结构暂不展开）。
     let mut meta = serde_json::Map::new();
     for line in meta_text.lines() {
@@ -142,7 +154,11 @@ pub fn remove_tool(tool: Tool, paths: &SkillPaths, name: &str) -> Result<(), Str
 fn render_skill(skill: &Skill) -> String {
     let mut out = String::from("---\n");
     out.push_str(&format!("name: {}\n", skill.name));
+    out.push_str(&format!("enabled: {}\n", skill.enabled));
     out.push_str(&format!("description: \"{}\"\n", skill.description.replace('"', "'")));
+    if let Some(url) = &skill.repo_url {
+        out.push_str(&format!("ns-repo-url: \"{}\"\n", url.replace('"', "'")));
+    }
     if !skill.allowed_tools.is_empty() {
         out.push_str("allowed-tools:\n");
         for t in &skill.allowed_tools {
@@ -204,5 +220,56 @@ mod tests {
         let (meta, body) = split_frontmatter("# 无元数据\n正文\n");
         assert!(meta.is_empty());
         assert!(body.starts_with("# 无元数据"));
+    }
+
+    #[test]
+    fn enabled_roundtrip() {
+        let s = Skill {
+            name: "disabled-skill".into(),
+            description: "禁用技能".into(),
+            body: "# 正文\n".into(),
+            enabled: false,
+            ..Default::default()
+        };
+        let rendered = render_skill(&s);
+        assert!(rendered.contains("enabled: false"), "禁用应写入 frontmatter: {rendered}");
+        // 写盘再读回，验证 enabled 往返。
+        let dir = std::env::temp_dir().join(format!("ns-skills-en-rt-{}-rt", std::process::id()));
+        let paths = SkillPaths { home: dir.clone(), shared: false };
+        let _ = std::fs::remove_dir_all(&dir);
+        write_tool(Tool::Codex, &paths, &s).unwrap();
+        let back = read_tool(Tool::Codex, &paths).unwrap();
+        assert_eq!(back.len(), 1);
+        assert!(!back[0].enabled, "读回应保留 disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enabled_defaults_true_when_absent() {
+        let rendered = "---\nname: x\n---\n正文\n";
+        let dir = std::env::temp_dir().join(format!("ns-skills-def-rt-{}", std::process::id()));
+        let paths = SkillPaths { home: dir.clone(), shared: false };
+        let d = dir.join(".agents").join("skills").join("x");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("SKILL.md"), rendered).unwrap();
+        let back = read_tool(Tool::Codex, &paths).unwrap();
+
+        assert!(back[0].enabled, "缺省应为启用");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shared_dir_routes_all_tools() {
+        let home = std::env::temp_dir().join(format!("ns-skills-shared-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut paths = SkillPaths { home: home.clone(), shared: true };
+        // shared=true：Claude/Gemini 也走 `~/.agents/skills`。
+        assert_eq!(skills_dir(Tool::Claude, &paths), home.join(".agents").join("skills"));
+        assert_eq!(skills_dir(Tool::Gemini, &paths), home.join(".agents").join("skills"));
+        // shared=false：非共享路径（各自目录；具体路径取决于 env，仅验证不指向共享）。
+        paths.shared = false;
+        assert_ne!(skills_dir(Tool::Claude, &paths), home.join(".agents").join("skills"));
+        assert_ne!(skills_dir(Tool::Gemini, &paths), home.join(".agents").join("skills"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

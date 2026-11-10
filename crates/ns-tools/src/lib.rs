@@ -57,6 +57,17 @@ impl Tool {
             Tool::Copilot => "npm install -g @github/copilot",
         }
     }
+
+    /// 卸载命令（npm 默认）。
+    pub fn uninstall_command(&self) -> &'static str {
+        match self {
+            Tool::ClaudeCode => "npm uninstall -g @anthropic-ai/claude-code",
+            Tool::Codex => "npm uninstall -g @openai/codex",
+            Tool::Gemini => "npm uninstall -g @google/gemini-cli",
+            Tool::Grok => "npm uninstall -g @grok-ai/cli",
+            Tool::Copilot => "npm uninstall -g @github/copilot",
+        }
+    }
 }
 
 /// 一个已安装的可执行。
@@ -98,6 +109,40 @@ pub fn detect_all() -> Vec<(Tool, Option<ToolInstall>)> {
         .collect()
 }
 
+/// 安装/升级工具：执行对应 npm install 命令。
+///
+/// 返回命令 stdout/stderr。调用方需在可执行 npm 的环境下运行。
+pub fn install_tool(tool: Tool) -> Result<String, String> {
+    run_package_command(tool, false)
+}
+
+/// 卸载工具：执行对应 npm uninstall 命令。
+pub fn uninstall_tool(tool: Tool) -> Result<String, String> {
+    run_package_command(tool, true)
+}
+
+fn run_package_command(tool: Tool, uninstall: bool) -> Result<String, String> {
+    let cmd = if uninstall {
+        tool.uninstall_command()
+    } else {
+        tool.install_command()
+    };
+    let mut parts = cmd.split_whitespace();
+    let bin = parts.next().ok_or("空命令")?;
+    let args: Vec<&str> = parts.collect();
+    let output = std::process::Command::new(bin)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("执行 {} 失败: {e}", cmd))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(if stdout.trim().is_empty() { stderr } else { stdout })
+    } else {
+        Err(if stderr.trim().is_empty() { stdout } else { stderr })
+    }
+}
+
 
 /// 诊断某工具是否重复安装（PATH 中出现 >1 个同名可执行）。
 pub fn duplicate_installations(tool: Tool) -> Vec<ToolInstall> {
@@ -107,6 +152,58 @@ pub fn duplicate_installations(tool: Tool) -> Vec<ToolInstall> {
     } else {
         Vec::new()
     }
+}
+
+/// 探测 WSL 内工具（仅 Windows；非 Windows 返回空）。
+///
+/// 经 `wsl.exe` 查询默认发行版内 `which <bin>` 的路径与版本。
+pub fn wsl_tools() -> Vec<ToolInstall> {
+    #[cfg(target_os = "windows")]
+    {
+        if !wsl_available() {
+            return Vec::new();
+        }
+        Tool::ALL
+            .iter()
+            .filter_map(|t| {
+                let bin = t.bin();
+                let which = wsl_run(&["which", bin])?;
+                let path = which.trim();
+                if path.is_empty() {
+                    return None;
+                }
+                let version = wsl_run(&[bin, "--version"]);
+                Some(ToolInstall {
+                    bin: bin.to_string(),
+                    path: path.to_string(),
+                    version,
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ();
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_available() -> bool {
+    std::process::Command::new("wsl.exe")
+        .arg("--status")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_run(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("wsl.exe").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// 读版本：运行 `<bin> --version`，取首行，剥离 `name/` 前缀。
@@ -174,5 +271,15 @@ mod tests {
         // 无 PATH 中工具时返回空（不 panic）。
         let dup = duplicate_installations(Tool::Grok);
         assert!(dup.len() <= 1);
+        assert!(dup.len() <= 1);
+    }
+
+    #[test]
+    fn wsl_tools_empty_on_non_windows() {
+        // 非 Windows 平台返回空；Windows 平台需真实 WSL（本机不可验证）。
+        #[cfg(not(target_os = "windows"))]
+        assert!(wsl_tools().is_empty());
+        #[cfg(target_os = "windows")]
+        assert!(wsl_tools().len() <= Tool::ALL.len());
     }
 }

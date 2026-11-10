@@ -68,7 +68,12 @@ pub fn sync_to(
 }
 
 /// 从本地目录安装一个技能（`<dir>/SKILL.md` 或 `<dir>/<name>.md`）。
-pub fn install_from_dir(dir: &Path, paths: &SkillPaths, targets: &[Tool]) -> Result<String, String> {
+pub fn install_from_dir(
+    dir: &Path,
+    paths: &SkillPaths,
+    targets: &[Tool],
+    repo_url: Option<&str>,
+) -> Result<String, String> {
     let skill_md = dir.join("SKILL.md");
     let file = if skill_md.exists() {
         skill_md
@@ -107,6 +112,7 @@ pub fn install_from_dir(dir: &Path, paths: &SkillPaths, targets: &[Tool]) -> Res
         allowed_tools: Vec::new(),
         body,
         source_path: Some(file.clone()),
+        repo_url: repo_url.map(|s| s.to_string()),
         enabled: true,
     };
     for &tool in targets {
@@ -143,15 +149,36 @@ pub fn install_from_github(
     if !status.success() {
         return Err(format!("git clone 失败（{repo_url}）"));
     }
-    let src = tmp.join("skills").join(name);
-    let installed = if src.join("SKILL.md").exists() {
-        install_from_dir(&src, paths, targets)?
+    // 定位技能源目录：优先 `<repo>/skills/<name>`；name 为空时扫描
+    // `skills/` 下的子目录（每个含 SKILL.md），装第一个找到的。
+    let skills_dir = tmp.join("skills");
+    let src = if !name.is_empty() {
+        Some(skills_dir.join(name))
+    } else {
+        find_skill_dir(&skills_dir)
+    };
+    let installed = if src.is_some() {
+        install_from_dir(src.as_deref().unwrap_or(&tmp), paths, targets, Some(repo_url))?
     } else {
         // 仓库根直接是技能文件。
-        install_from_dir(&tmp, paths, targets)?
+        install_from_dir(&tmp, paths, targets, Some(repo_url))?
     };
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(installed)
+}
+
+/// 在 `<dir>/skills/` 下查找第一个含 `SKILL.md` 的子目录（或目录本身）。
+fn find_skill_dir(dir: &Path) -> Option<PathBuf> {
+    if dir.join("SKILL.md").exists() {
+        return Some(dir.to_path_buf());
+    }
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() && p.join("SKILL.md").exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// 简易前端元数据解析（与 tools 保持一致，避免循环依赖）。
@@ -167,7 +194,7 @@ fn split_meta(text: &str) -> (std::collections::BTreeMap<String, String>, String
         return (std::collections::BTreeMap::new(), trimmed.to_string());
     }
     let meta_text = &trimmed[4..body_end.unwrap()];
-    let body = trimmed[body_end.unwrap() + 4..].to_string();
+    let body = trimmed[body_end.unwrap() + 5..].to_string();
     let mut meta = std::collections::BTreeMap::new();
     for line in meta_text.lines() {
         let line = line.trim();
@@ -179,6 +206,65 @@ fn split_meta(text: &str) -> (std::collections::BTreeMap<String, String>, String
         }
     }
     (meta, body)
+}
+/// 检查所有 GitHub 来源技能是否有更新。
+///
+/// 对每个 `repo_url` 非空的技能浅克隆最新仓库到临时目录，解析对应
+/// `SKILL.md`（`<repo>/skills/<name>`），与当前 `body`/`description` 对比；
+/// 不同则视为有更新。返回有更新的技能名列表。
+pub fn check_for_updates(skills: &[Skill]) -> Result<Vec<String>, String> {
+    let mut updated = Vec::new();
+    for skill in skills {
+        let Some(repo) = &skill.repo_url else {
+            continue;
+        };
+        let slug = repo
+            .trim_end_matches('/')
+            .rsplit('/')
+            .take(2)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("-");
+        let tmp = std::env::temp_dir().join(format!("ns-skills-upd-{slug}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let status = std::process::Command::new("git")
+            .args(["clone", "--depth", "1", repo])
+            .arg(&tmp)
+            .status()
+            .map_err(|e| format!("git 不可用: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            continue;
+        }
+        // 定位最新源文件：`<repo>/skills/<name>/SKILL.md` 或根。
+        let latest = tmp
+            .join("skills")
+            .join(&skill.name)
+            .join("SKILL.md");
+        let latest = if latest.exists() {
+            latest
+        } else {
+            let root = tmp.join("SKILL.md");
+            if root.exists() {
+                root
+            } else {
+                let _ = std::fs::remove_dir_all(&tmp);
+                continue;
+            }
+        };
+        if let Ok(text) = std::fs::read_to_string(&latest) {
+            let (meta, body) = split_meta(&text);
+            let desc = meta.get("description").cloned().unwrap_or_default();
+            if body != skill.body || desc != skill.description {
+                updated.push(skill.name.clone());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    Ok(updated)
 }
 
 #[cfg(test)]
@@ -204,7 +290,7 @@ mod tests {
             std::env::set_var("CODEX_HOME", base.join("codex"));
             std::env::set_var("GEMINI_CLI_HOME", base.clone());
         }
-        SkillPaths { home: base }
+        SkillPaths { home: base, shared: false }
     }
 
     #[test]
@@ -249,10 +335,69 @@ mod tests {
             "---\nname: git-helper\ndescription: git 辅助\n---\n# 用法\n",
         )
         .unwrap();
-        let name = install_from_dir(&src, &paths, &[Tool::Claude, Tool::Gemini]).unwrap();
+        let name = install_from_dir(&src, &paths, &[Tool::Claude, Tool::Gemini], None).unwrap();
         assert_eq!(name, "git-helper");
         let claude = read_tool(Tool::Claude, &paths).unwrap();
         assert!(claude.iter().any(|s| s.name == "git-helper"));
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn check_for_updates_detects_change() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let repo = std::env::temp_dir().join(format!("ns-skill-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("skills/demo")).unwrap();
+        std::fs::write(
+            repo.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: v1\n---\n# v1\n",
+        )
+        .unwrap();
+        // 初始化本地 git 仓库（供 clone 用）。
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status();
+        if init.map(|s| !s.success()).unwrap_or(true) {
+            return; // git 不可用则跳过（不失败）。
+        }
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"])
+            .current_dir(&repo)
+            .status();
+        let url = format!("file://{}", repo.display());
+        let paths = temp_paths();
+        let name = install_from_dir(
+            &repo.join("skills/demo"),
+            &paths,
+            &[Tool::Claude],
+            Some(&url),
+        )
+        .unwrap();
+        assert_eq!(name, "demo");
+        let skills = read_tool(Tool::Claude, &paths).unwrap();
+        assert_eq!(skills[0].repo_url.as_deref(), Some(url.as_str()));
+        // 无更新：内容一致。
+        assert!(check_for_updates(&skills).unwrap().is_empty());
+        // 有更新：改描述后 clone 检出不一致。
+        std::fs::write(
+            repo.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: v2\n---\n# v2\n",
+        )
+        .unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "v2"])
+            .current_dir(&repo)
+            .status();
+        assert!(check_for_updates(&skills).unwrap().contains(&"demo".to_string()));
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

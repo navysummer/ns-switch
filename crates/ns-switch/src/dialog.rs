@@ -1,8 +1,9 @@
 //! 添加/编辑供应商对话框：预设搜索 + 关键字段表单 + 配置预览。
 
-use gpui::{Context, Div, div, prelude::*, px, rgb};
+use gpui::{Context, Div, div, prelude::*, px};
 use ns_presets::{Preset, Provider, ProviderMeta, search_presets};
 use ns_ui::{theme, widgets};
+use crate::app::StatusTone;
 
 /// 对话框字段输入。
 #[derive(Debug, Clone, Default)]
@@ -11,7 +12,14 @@ pub struct DialogFields {
     pub key: String,
     pub model: String,
     pub usage_script: String,
-
+    /// API 格式：anthropic / openai_chat / openai_responses / gemini_native
+    pub api_format: String,
+    /// 图标（预设/供应商图标 id；自定义可覆盖）。
+    pub icon: String,
+    /// 图标颜色（十六进制 `#RRGGBB`；空 = 使用主题强调色）。
+    pub icon_color: String,
+    /// 是否启用用量查询（false = 卡片不显示配额脚注/不自动查询）。
+    pub usage_enabled: bool,
 }
 
 impl DialogFields {
@@ -19,6 +27,10 @@ impl DialogFields {
     pub fn from_preset(preset: &Preset) -> Self {
         let mut f = Self::default();
         f.model = preset_default_model(preset);
+        f.api_format = preset.api_format.to_string();
+        f.icon = preset.icon.to_string();
+        f.icon_color = preset.icon_color.to_string();
+        f.usage_enabled = true;
         f
     }
 
@@ -62,6 +74,18 @@ impl DialogFields {
                 .as_ref()
                 .and_then(|m| m.usage_script.clone())
                 .unwrap_or_default(),
+            api_format: p
+                .meta
+                .as_ref()
+                .and_then(|m| m.api_format.clone())
+                .unwrap_or_else(|| "anthropic".into()),
+            icon: p.icon.clone().unwrap_or_default(),
+            icon_color: p.icon_color.clone().unwrap_or_default(),
+            usage_enabled: p
+                .meta
+                .as_ref()
+                .map(|m| m.usage_enabled)
+                .unwrap_or(true),
         }
     }
 }
@@ -72,6 +96,8 @@ pub struct DialogInputs {
     pub key: gpui::Entity<crate::text_field::TextField>,
     pub model: gpui::Entity<crate::text_field::TextField>,
     pub usage_script: gpui::Entity<crate::text_field::TextField>,
+    pub icon: gpui::Entity<crate::text_field::TextField>,
+    pub icon_color: gpui::Entity<crate::text_field::TextField>,
 }
 
 impl DialogInputs {
@@ -84,6 +110,8 @@ impl DialogInputs {
             key: cx.new(|cx| crate::text_field::TextField::new("sk-…", cx)),
             model: cx.new(|cx| crate::text_field::TextField::new("模型名", cx)),
             usage_script: cx.new(|cx| crate::text_field::TextField::new("/path/to/usage.js", cx)),
+            icon: cx.new(|cx| crate::text_field::TextField::new("图标 id（如 openai）", cx)),
+            icon_color: cx.new(|cx| crate::text_field::TextField::new("#RRGGBB（空=主题色）", cx)),
         }
     }
 }
@@ -113,9 +141,9 @@ pub fn add_dialog(
                 .w(px(560.))
                 .max_h(px(620.))
                 .rounded(px(14.))
-                .bg(theme::color(theme::PANEL_SOLID))
+                .bg(theme::panel())
                 .border_1()
-                .border_color(theme::alpha(theme::STROKE, 0.25))
+                .border_color(theme::stroke_a(0.25))
                 .shadow_lg()
                 .flex_col()
                 .child(dialog_header(tool, editing, cx))
@@ -131,7 +159,7 @@ pub fn add_dialog(
 fn dialog_header(
     tool: ns_presets::Tool,
     editing: bool,
-    _cx: &mut Context<crate::app::SwitchApp>,
+    cx: &mut Context<crate::app::SwitchApp>,
 ) -> Div {
     let title = if editing {
         format!("编辑供应商 · {}", tool.label())
@@ -145,15 +173,27 @@ fn dialog_header(
         .items_center()
         .justify_between()
         .border_b_1()
-        .border_color(theme::alpha(theme::STROKE, 0.12))
+        .border_color(theme::stroke_a(0.12))
         .child(
             div()
                 .text_size(px(14.))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(rgb(theme::TEXT))
+                .text_color(theme::text())
                 .child(title),
         )
-        .child(widgets::ghost_button("dlg-close", "✕"))
+        .child(widgets::ghost_button("dlg-close", "✕").on_click(cx.listener(
+            |this, _, _, cx| {
+                if this.dialog_is_dirty(cx) {
+                    this.dialog_dirty = true;
+                    cx.notify();
+                    return;
+                }
+                this.add_open = false;
+                this.edit_id = None;
+                this.dialog_preset = None;
+                cx.notify();
+            },
+        )))
 }
 
 fn search_box(inputs: &DialogInputs, _cx: &mut Context<crate::app::SwitchApp>) -> Div {
@@ -167,7 +207,7 @@ fn search_box(inputs: &DialogInputs, _cx: &mut Context<crate::app::SwitchApp>) -
                 .rounded(px(8.))
                 .bg(theme::alpha(0x000000, 0.25))
                 .border_1()
-                .border_color(theme::alpha(theme::STROKE, 0.14))
+                .border_color(theme::stroke_a(0.14))
                 .flex()
                 .items_center()
                 .child(inputs.search.clone()),
@@ -206,7 +246,7 @@ fn preset_row(preset: &'static Preset, cx: &mut Context<crate::app::SwitchApp>) 
         .items_center()
         .gap(px(10.))
         .cursor_pointer()
-        .hover(|s| s.bg(theme::alpha(theme::STROKE, 0.08)))
+        .hover(|s| s.bg(theme::stroke_a(0.08)))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.dialog_preset = Some(pid.clone());
             this.dialog_fields = DialogFields::from_preset(preset);
@@ -220,7 +260,7 @@ fn preset_row(preset: &'static Preset, cx: &mut Context<crate::app::SwitchApp>) 
                 .items_center()
                 .justify_center()
                 .bg(theme::gold_gradient())
-                .text_color(rgb(theme::DARK_TEXT))
+                .text_color(theme::dark_text())
                 .text_size(px(11.))
                 .child(preset.name.chars().next().unwrap_or('?').to_string()),
         )
@@ -228,13 +268,13 @@ fn preset_row(preset: &'static Preset, cx: &mut Context<crate::app::SwitchApp>) 
             div()
                 .flex_1()
                 .text_size(px(12.))
-                .text_color(rgb(theme::TEXT))
+                .text_color(theme::text())
                 .child(preset.name),
         )
         .child(
             div()
                 .text_size(px(9.5))
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(theme::text_faint())
                 .child(preset.aliases.first().copied().unwrap_or("")),
         )
 }
@@ -255,6 +295,11 @@ fn form_and_preview(
     live_fields.key = key.clone();
     live_fields.model = model.clone();
     live_fields.usage_script = inputs.usage_script.read(cx).text();
+    live_fields.icon = inputs.icon.read(cx).text();
+    live_fields.icon_color = inputs.icon_color.read(cx).text();
+    if live_fields.api_format.is_empty() {
+        live_fields.api_format = preset.api_format.to_string();
+    }
     let save_label = if editing { "保存修改" } else { "添加并保存" };
 
     div()
@@ -268,30 +313,99 @@ fn form_and_preview(
                 .flex_col()
                 .gap(px(10.))
                 .child(field_input("接口地址", &inputs.endpoint, cx))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .child(
+                            widgets::ghost_button("dlg-test-endpoint", "测试连接")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let url = this.dialog_inputs.endpoint.read(cx).text().trim().to_string();
+                                    if url.is_empty() {
+                                        this.status = "请先填写接口地址".into();
+                                        cx.notify();
+                                        return;
+                                    }
+                                    let name = "对话框端点".to_string();
+                                    this.status = format!("正在测试连接：{name} …");
+                                    cx.notify();
+                                    cx.spawn(async move |this, cx| {
+                                        let test_url = url.clone();
+                                        let result = cx
+                                            .background_executor()
+                                            .spawn(async move {
+                                                std::process::Command::new("curl")
+                                                    .args(["-sS", "-o", "/dev/null", "-m", "8", "-w", "%{http_code}", "-I", &test_url])
+                                                    .output()
+                                            })
+                                            .await;
+                                        let msg = match result {
+                                            Ok(o) => {
+                                                let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                                if o.status.success() || (!code.is_empty() && code != "000") {
+                                                    format!("HTTP {code} · {url}")
+                                                } else {
+                                                    format!("无法连接 · {url}")
+                                                }
+                                            }
+                                            Err(e) => format!("执行 curl 失败: {e}"),
+                                        };
+                                        this.update(cx, |this, cx| {
+                                            this.status = format!("连通性测试：{msg}");
+                                            cx.notify();
+                                        }).ok();
+                                    }).detach();
+                                })),
+                        ),
+                )
                 .child(field_input("API 密钥", &inputs.key, cx))
-
                 .child(field_input("模型", &inputs.model, cx))
-                .child(field_input("用量脚本路径", &inputs.usage_script, cx)),
-            )
+                .child(api_format_selector(&live_fields.api_format, cx))
+                .child(field_input("用量脚本路径", &inputs.usage_script, cx))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(widgets::section_label("启用用量查询"))
+                        .child(
+                            div()
+                                .id("dlg-usage-enabled")
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dialog_fields.usage_enabled =
+                                        !this.dialog_fields.usage_enabled;
+                                    cx.notify();
+                                }))
+                                .child(if live_fields.usage_enabled {
+                                    widgets::pill("启用", theme::jade())
+                                } else {
+                                    widgets::pill("停用", theme::text_dim())
+                                }),
+                        ),
+                )
+                .child(field_input("图标", &inputs.icon, cx))
+                .child(field_input("图标颜色", &inputs.icon_color, cx)),
+        )
         .child(
             div()
                 .flex_1()
                 .border_l_1()
-                .border_color(theme::alpha(theme::STROKE, 0.12))
+                .border_color(theme::stroke_a(0.12))
                 .p(px(16.))
                 .flex_col()
                 .gap(px(8.))
                 .child(
                     div()
                         .text_size(px(10.5))
-                        .text_color(rgb(theme::TEXT_FAINT))
-                        .child("配置预览"),
+                        .text_color(theme::text_faint())
+                        .child("配置预览（切换后写入客户端的关键字段）"),
                 )
                 .child(
                     div()
                         .font_family(theme::MONO_FONT)
                         .text_size(px(10.))
-                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_color(theme::text_dim())
                         .child(preview_text(preset, &live_fields)),
                 ),
         )
@@ -302,7 +416,14 @@ fn form_and_preview(
                 .flex()
                 .justify_end()
                 .gap(px(8.))
-                .child(widgets::ghost_button("dlg-cancel", "取消"))
+                .child(widgets::ghost_button("dlg-cancel", "取消").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.add_open = false;
+                        this.edit_id = None;
+                        this.dialog_preset = None;
+                        cx.notify();
+                    },
+                )))
                 .child(
                     widgets::primary_button("dlg-save", save_label)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -310,6 +431,61 @@ fn form_and_preview(
                             crate::dialog::save_provider(this, preset, &save_fields, cx);
                         })),
                 ),
+        )
+}
+
+fn api_format_selector(current: &str, cx: &mut Context<crate::app::SwitchApp>) -> Div {
+    let formats = [
+        ("anthropic", "Anthropic"),
+        ("openai_chat", "OpenAI Chat"),
+        ("openai_responses", "OpenAI Resp"),
+        ("gemini_native", "Gemini"),
+    ];
+    let cur = if current.is_empty() { "anthropic" } else { current };
+    div()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(theme::text_faint())
+                .child("上游 API 格式（路由/聚合使用）"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.))
+                .children(formats.into_iter().enumerate().map(|(i, (id, label))| {
+                    let selected = cur == id;
+                    let id_owned = id.to_string();
+                    let mut b = div()
+                        .id(("fmt", i))
+                        .h(px(26.))
+                        .px(px(8.))
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(px(10.5))
+                        .child(label.to_string());
+                    b = if selected {
+                        b.bg(theme::accent_a(0.18))
+                            .border_1()
+                            .border_color(theme::accent_a(0.5))
+                            .text_color(theme::text())
+                    } else {
+                        b.bg(theme::surface_a(0.35))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.12))
+                            .text_color(theme::text_dim())
+                            .hover(|s| s.bg(theme::stroke_a(0.08)))
+                    };
+                    b.on_click(cx.listener(move |this, _, _, cx| {
+                        this.dialog_fields.api_format = id_owned.clone();
+                        cx.notify();
+                    }))
+                })),
         )
 }
 
@@ -325,7 +501,7 @@ fn field_input(
         .child(
             div()
                 .text_size(px(10.))
-                .text_color(rgb(theme::TEXT_FAINT))
+                .text_color(theme::text_faint())
                 .child(label),
         )
         .child(
@@ -335,7 +511,7 @@ fn field_input(
                 .rounded(px(8.))
                 .bg(theme::alpha(0x000000, 0.25))
                 .border_1()
-                .border_color(theme::alpha(theme::STROKE, 0.14))
+                .border_color(theme::stroke_a(0.14))
                 .flex()
                 .items_center()
                 .child(input.clone()),
@@ -363,7 +539,12 @@ pub fn build_provider(
         sort_index: None,
         notes: None,
         meta: {
-            let has_fmt = preset.api_format != "anthropic";
+            let fmt = if fields.api_format.is_empty() {
+                preset.api_format
+            } else {
+                fields.api_format.as_str()
+            };
+            let has_fmt = fmt != "anthropic";
             let routes = preset.desktop_routes.map(|(s, o, h)| {
                 vec![s.to_string(), o.to_string(), h.to_string()]
             });
@@ -371,14 +552,23 @@ pub fn build_provider(
                 None
             } else {
                 Some(ProviderMeta {
-                    api_format: has_fmt.then(|| preset.api_format.to_string()),
+                    api_format: has_fmt.then(|| fmt.to_string()),
                     models: routes,
+                    usage_enabled: fields.usage_enabled,
                     ..Default::default()
                 })
             }
         },
-        icon: Some(preset.icon.to_string()),
-        icon_color: Some(preset.icon_color.to_string()),
+        icon: if fields.icon.trim().is_empty() {
+            Some(preset.icon.to_string())
+        } else {
+            Some(fields.icon.trim().to_string())
+        },
+        icon_color: if fields.icon_color.trim().is_empty() {
+            Some(preset.icon_color.to_string())
+        } else {
+            Some(fields.icon_color.trim().to_string())
+        },
         in_failover_queue: false,
     }
 }
@@ -390,13 +580,27 @@ pub fn save_provider(
     fields: &DialogFields,
     cx: &mut gpui::Context<crate::app::SwitchApp>,
 ) {
-    let editing = app.edit_id.clone();
-    let mut provider = build_provider(preset, fields);
-    if !fields.usage_script.is_empty() {
-        let mut meta = provider.meta.clone().unwrap_or_default();
-        meta.usage_script = Some(fields.usage_script.clone());
-        provider.meta = Some(meta);
+    // 校验：官方/开源官方走 env 内置配置，无需 endpoint；本机服务无需密钥；
+    // 其余供应商必须填接口地址，云服务/聚合/第三方/自定义必须填密钥。
+    let is_official = matches!(
+        preset.category,
+        ns_presets::ProviderCategory::Official | ns_presets::ProviderCategory::CnOfficial
+    );
+    let is_local = preset.category == ns_presets::ProviderCategory::Local;
+    if !is_official && fields.endpoint.trim().is_empty() {
+        app.status = "请填写接口地址".into();
+        app.status_tone = StatusTone::Error;
+        cx.notify();
+        return;
     }
+    if !is_local && !is_official && fields.key.trim().is_empty() {
+        app.status = "请填写 API 密钥".into();
+        app.status_tone = StatusTone::Error;
+        cx.notify();
+        return;
+    }
+    let editing = app.edit_id.clone();
+    let provider = build_provider(preset, fields);
     let name = provider.name.clone();
     let id = provider.id.clone();
     let result = {
@@ -413,11 +617,18 @@ pub fn save_provider(
             updated.name = provider.name.clone();
             updated.icon = provider.icon.clone();
             updated.icon_color = provider.icon_color.clone();
-            // 合并用量脚本路径（保留原 meta 其他字段）。
-            if !fields.usage_script.is_empty() {
+            // 合并用量脚本路径与 API 格式（保留原 meta 其他字段）。
+            {
                 let mut meta = updated.meta.take().unwrap_or_default();
-                meta.usage_script = Some(fields.usage_script.clone());
-                updated.meta = Some(meta);
+                if !fields.usage_script.is_empty() {
+                    meta.usage_script = Some(fields.usage_script.clone());
+                }
+                if !fields.api_format.is_empty() {
+                    meta.api_format = Some(fields.api_format.clone());
+                }
+                if meta.usage_script.is_some() || meta.api_format.is_some() || meta.models.is_some() {
+                    updated.meta = Some(meta);
+                }
             }
             store.update_provider(updated)
         } else {
@@ -437,6 +648,7 @@ pub fn save_provider(
     } else {
         format!("已添加供应商 {name}（{id}）")
     };
+    app.status_tone = StatusTone::Success;
     app.refresh_tray_menu(cx);
     cx.notify();
 }
@@ -456,6 +668,10 @@ mod tests {
             key: "sk-test".into(),
             model: "claude-sonnet-4-5".into(),
             usage_script: String::new(),
+            api_format: "anthropic".into(),
+            icon: preset.icon.to_string(),
+            icon_color: preset.icon_color.to_string(),
+            usage_enabled: true,
         };
         let provider = build_provider(preset, &fields);
         assert!(provider.id.starts_with("claude-88api-"));

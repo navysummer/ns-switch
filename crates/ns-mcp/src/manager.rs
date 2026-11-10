@@ -10,7 +10,7 @@ use ns_presets::Tool;
 use serde_json::Value;
 
 use crate::model::McpServer;
-use crate::tools::{claude, codex, gemini, McpPaths};
+use crate::tools::{claude, codex, gemini, grok, hermes, kimi, minimax, omp, opencode, openclaw, pi, McpPaths};
 
 /// 一次读某工具 MCP 服务器（用户作用域）。未知工具返回空。
 pub fn read_tool(tool: Tool, paths: &McpPaths) -> Result<Vec<McpServer>, String> {
@@ -21,6 +21,14 @@ pub fn read_tool(tool: Tool, paths: &McpPaths) -> Result<Vec<McpServer>, String>
             let (servers, _en) = gemini::load(&paths.gemini_settings())?;
             Ok(servers)
         }
+        Tool::Opencode => opencode::load(&paths.opencode_config()),
+        Tool::GrokBuild => grok::load(&paths.grok_config()),
+        Tool::Kimi => kimi::load(&paths.kimi_config()),
+        Tool::Openclaw => openclaw::load(&paths.openclaw_config()),
+        Tool::Hermes => hermes::load(&paths.hermes_config()),
+        Tool::Pi => pi::load(&paths.pi_mcp()),
+        Tool::Mcode => minimax::load(&paths.minimax_mcp()),
+        Tool::Omp => omp::load(&paths.omp_mcp()),
         _ => Ok(Vec::new()),
     }
 }
@@ -66,6 +74,78 @@ pub fn write_tool(
             }
             Ok(changed)
         }
+        Tool::Opencode => {
+            let path = paths.opencode_config();
+            let mut doc = read_json_or_empty(&path)?;
+            let changed = opencode::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_json(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::GrokBuild => {
+            let path = paths.grok_config();
+            let mut doc = read_toml_or_empty(&path)?;
+            let changed = grok::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_toml(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::Kimi => {
+            let path = paths.kimi_config();
+            let mut doc = read_toml_or_empty(&path)?;
+            let changed = kimi::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_toml(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::Openclaw => {
+            let path = paths.openclaw_config();
+            let mut doc = read_json_or_empty(&path)?;
+            let changed = openclaw::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_json(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::Hermes => {
+            let path = paths.hermes_config();
+            let mut doc = read_yaml_or_empty(&path)?;
+            let changed = hermes::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_yaml(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::Pi => {
+            let path = paths.pi_mcp();
+            let mut doc = read_json_or_empty(&path)?;
+            let changed = pi::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_json(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::Mcode => {
+            let path = paths.minimax_mcp();
+            let mut doc = read_json_or_empty(&path)?;
+            let changed = minimax::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_json(&path, &doc)?;
+            }
+            Ok(changed)
+        }
+        Tool::Omp => {
+            let path = paths.omp_mcp();
+            let mut doc = read_json_or_empty(&path)?;
+            let changed = omp::apply_servers(&mut doc, remove, upserts);
+            if changed {
+                write_json(&path, &doc)?;
+            }
+            Ok(changed)
+        }
         _ => Ok(false),
     }
 }
@@ -107,6 +187,26 @@ pub fn write_toml(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), Strin
     }
     std::fs::write(path, doc.to_string())
         .map_err(|e| format!("写 {} 失败: {e}", path.display()))
+}
+
+/// 读取 YAML 文件（不存在视为空映射）。
+pub fn read_yaml_or_empty(path: &Path) -> Result<serde_yaml::Value, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => hermes::validate_doc(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()))
+        }
+        Err(e) => Err(format!("读取 {} 失败: {e}", path.display())),
+    }
+}
+
+/// 写 YAML 文件。
+pub fn write_yaml(path: &Path, doc: &serde_yaml::Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_yaml::to_string(doc).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("写 {} 失败: {e}", path.display()))
 }
 
 /// 把某工具的服务器同步到另一组工具（跨工具同步）。

@@ -29,6 +29,8 @@ pub struct PromptsPanel {
     pub confirm_delete: Option<String>,
     /// 最近一次写回结果消息。
     pub write_msg: String,
+    /// 未保存更改确认关闭（true = 显示确认浮层）。
+    pub confirm_close: bool,
 }
 
 impl PromptsPanel {
@@ -42,6 +44,7 @@ impl PromptsPanel {
             form: None,
             confirm_delete: None,
             write_msg: String::new(),
+            confirm_close: false,
         }
     }
 
@@ -129,6 +132,38 @@ impl PromptsPanel {
         };
         self.dialog_open = false;
         self.load(cx);
+    }
+
+    /// 表单是否有未保存更改（与打开时快照比对）。
+    pub fn form_dirty(&self, cx: &mut Context<crate::app::SwitchApp>) -> bool {
+        let Some(form) = &self.form else {
+            return false;
+        };
+        let name = form.name.read(cx).text();
+        let body = form.body.read(cx).text();
+        if let Some(orig) = &self.editing_name {
+            let entry = self.entries.iter().find(|e| &e.name == orig);
+            match entry {
+                Some(e) => {
+                    name.trim() != e.name
+                        || body.trim() != e.body.trim()
+                        || form.enabled != e.enabled
+                }
+                None => !name.trim().is_empty() || !body.trim().is_empty(),
+            }
+        } else {
+            !name.trim().is_empty() || !body.trim().is_empty()
+        }
+    }
+
+    /// 尝试关闭对话框：若有未保存更改则先弹确认。
+    pub fn request_close(&mut self, cx: &mut Context<crate::app::SwitchApp>) {
+        if self.form_dirty(cx) {
+            self.confirm_close = true;
+        } else {
+            self.dialog_open = false;
+        }
+        cx.notify();
     }
 
     /// 删除确认。

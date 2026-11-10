@@ -74,6 +74,13 @@ pub fn plan_for_tool_in(tool: Tool, provider: &Provider, home: &std::path::Path)
             }
             plans
         }
+        Tool::GrokBuild => {
+            let id = provider.id.clone();
+            vec![LivePlan {
+                file: LiveFile::new("grok", home.join(".grok").join("config.toml"), true),
+                patch: Patch::Toml(ns_live::grok_patch(&id, cfg)),
+            }]
+        }
         // 共存式工具（additive）：把供应商 upsert 进工具自身配置。
         Tool::Opencode => vec![LivePlan {
             file: LiveFile::new("opencode", home.join(".config").join("opencode").join("opencode.json"), true),
@@ -140,8 +147,10 @@ pub fn routing_plans_for_tool_in(
                 patch: Patch::Env(gemini_routing_env_patch(port)),
             },
         ],
-        // GrokBuild 路由：M5 后续子任务接入（当前仅记录开关）。
-        Tool::GrokBuild => Vec::new(),
+        Tool::GrokBuild => vec![LivePlan {
+            file: LiveFile::new("grok", home.join(".grok").join("config.toml"), true),
+            patch: Patch::Toml(ns_live::grok_routing_patch("grok-routing", port)),
+        }],
         _ => Vec::new(),
     }
 }
@@ -655,6 +664,45 @@ mod tests {
         let env = std::fs::read_to_string(home.join(".gemini").join(".env")).unwrap();
         assert!(env.contains("GEMINI_BASE_URL=http://127.0.0.1:8900"));
         assert!(env.contains("GEMINI_API_KEY=ns-switch-routing"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn grok_switch_writes_config_toml() {
+        let base = std::env::temp_dir().join(format!("ns-switch-grok-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let p = Provider::with_id(
+            "grok-88api-test".into(),
+            "88API".into(),
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.88api.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-grok",
+                    "ANTHROPIC_MODEL": "grok-4.5",
+                }
+            }),
+        );
+        let o = switch_to_in(Tool::GrokBuild, &p, &backup, &home).unwrap();
+        assert_eq!(o.written, 1);
+        let text = std::fs::read_to_string(home.join(".grok").join("config.toml")).unwrap();
+        assert!(text.contains("[model.grok-88api-test]"), "写入模型段: {text}");
+        assert!(text.contains("https://api.88api.com"));
+        assert!(text.contains("sk-grok"));
+        assert!(text.contains("default = \"grok-88api-test\""));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn grok_routing_switch_writes_localhost() {
+        let base = std::env::temp_dir().join(format!("ns-switch-grok-r-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let o = switch_to_routing_in(Tool::GrokBuild, 8903, &backup, &home).unwrap();
+        assert_eq!(o.written, 1);
+        let text = std::fs::read_to_string(home.join(".grok").join("config.toml")).unwrap();
+        assert!(text.contains("http://127.0.0.1:8903"));
+        assert!(text.contains("ns-switch-routing"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

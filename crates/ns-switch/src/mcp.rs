@@ -1,5 +1,5 @@
 //! M7 统一 MCP 面板。
-//!
+
 //! 以「服务器」为第一视图：列出某工具的全部 MCP 服务器，可新增/编辑/
 //! 删除/启停，并一键同步到其他工具。读写经 `ns_mcp::manager`，每次操作
 //! 只改该工具的 `mcpServers`/`mcp_servers` 键。
@@ -32,6 +32,12 @@ pub struct McpPanel {
     pub confirm_delete: Option<String>,
     /// 最近一次写回结果消息。
     pub write_msg: String,
+    /// 项目作用域选择对话框是否打开。
+    pub scope_open: bool,
+    /// 项目作用域路径输入。
+    pub scope_path: Entity<TextField>,
+    /// 项目作用域 MCP 读取结果。
+    pub scope_result: String,
 }
 
 impl McpPanel {
@@ -45,6 +51,9 @@ impl McpPanel {
             form: McpForm::new(cx),
             confirm_delete: None,
             write_msg: String::new(),
+            scope_open: false,
+            scope_path: cx.new(|cx| TextField::new("/path/to/project", cx)),
+            scope_result: String::new(),
         }
     }
 }
@@ -57,6 +66,8 @@ pub struct McpForm {
     pub url: Entity<TextField>,
     pub enabled: bool,
     pub transport: McpTransport,
+    pub env_raw: Entity<TextField>,
+    pub headers_raw: Entity<TextField>,
 }
 
 // (McpForm 无 Default：实体字段需 cx 创建，见 McpForm::new/empty。)
@@ -71,6 +82,8 @@ impl McpForm {
             url: cx.new(|cx| TextField::new("https://.../mcp", cx)),
             enabled: true,
             transport: McpTransport::Stdio,
+            env_raw: cx.new(|cx| TextField::new("环境变量（每行 key=value）", cx)),
+            headers_raw: cx.new(|cx| TextField::new("请求头（每行 key: value）", cx)),
         }
     }
 
@@ -85,6 +98,11 @@ impl McpForm {
         if let Some(url) = &s.url {
             self.url.update(cx, |f, _| f.set_text(url));
         }
+        // Populate env and headers from server data
+        let env_lines: Vec<String> = s.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        self.env_raw.update(cx, |f, _| f.set_text(&env_lines.join("\n")));
+        let header_lines: Vec<String> = s.headers.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+        self.headers_raw.update(cx, |f, _| f.set_text(&header_lines.join("\n")));
     }
 
 }
@@ -112,6 +130,125 @@ impl McpPanel {
         }
         cx.notify();
     }
+
+    /// 打开项目作用域选择对话框。
+    pub fn open_scope(&mut self, cx: &mut Context<crate::app::SwitchApp>) {
+        self.scope_open = true;
+        self.scope_result = String::new();
+        cx.notify();
+    }
+
+    /// 读取指定项目目录的项目作用域 MCP（`.mcp.json`，Claude Code 约定）。
+    pub fn read_scope(&mut self, cx: &mut Context<crate::app::SwitchApp>) {
+        let path = self.scope_path.read(cx).text();
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            self.scope_result = "请输入项目目录路径".into();
+            cx.notify();
+            return;
+        }
+        // Claude 项目级 `.mcp.json`（mcpServers 对象）优先；Codex 项目级
+        // `.codex/config.toml`（[mcp_servers.<name>] 节）为备选。
+        let base = std::path::Path::new(&path);
+        let mcp_file = base.join(".mcp.json");
+        let codex_file = base.join(".codex").join("config.toml");
+        if !mcp_file.exists() && !codex_file.exists() {
+            self.scope_result = format!(
+                "未找到项目级 MCP 配置（{} / {}）",
+                mcp_file.display(),
+                codex_file.display()
+            );
+            cx.notify();
+            return;
+        }
+        if mcp_file.exists() {
+            match std::fs::read_to_string(&mcp_file) {
+                Ok(text) => {
+                    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
+                    match parsed {
+                        Ok(v) => {
+                            let servers = v
+                                .get("mcpServers")
+                                .and_then(|s| s.as_object())
+                                .map(|o| o.keys().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            self.scope_result = if servers.is_empty() {
+                                format!("已读取 {}（无 mcpServers 条目）", mcp_file.display())
+                            } else {
+                                format!(
+                                    "{}：{} 个项目作用域服务器",
+                                    mcp_file.display(),
+                                    servers.join(", ")
+                                )
+                            };
+                        }
+                        Err(e) => {
+                            self.scope_result = format!("{} 解析失败: {e}", mcp_file.display());
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.scope_result = format!("读取失败: {e}");
+                }
+            }
+        } else {
+            // Codex 项目级 `[mcp_servers.<name>]` 节名扫描。
+            match std::fs::read_to_string(&codex_file) {
+                Ok(text) => {
+                    let servers = codex_project_mcp_names(&text);
+                    self.scope_result = if servers.is_empty() {
+                        format!("已读取 {}（无 mcp_servers 条目）", codex_file.display())
+                    } else {
+                        format!(
+                            "{}：{} 个项目作用域服务器",
+                            codex_file.display(),
+                            servers.join(", ")
+                        )
+                    };
+                }
+                Err(e) => {
+                    self.scope_result = format!("读取失败: {e}");
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 打开原生目录选择器（macOS `osascript`），回填 scope_path。
+    ///
+    /// Linux/Windows 无内建选择器，提示手输路径。
+    pub fn choose_scope_dir(&mut self, cx: &mut Context<crate::app::SwitchApp>) {
+        #[cfg(target_os = "macos")]
+        {
+            let script = "POSIX path of (choose folder with prompt \"选择项目目录\")";
+            let out = std::process::Command::new("osascript")
+                .args(["-e", script])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !dir.is_empty() {
+                        self.scope_path.update(cx, |tf, _| tf.set_text(&dir));
+                    } else {
+                        self.scope_result = "未选择目录".into();
+                    }
+                }
+                Ok(o) => {
+                    self.scope_result =
+                        format!("选择目录失败: {}", String::from_utf8_lossy(&o.stderr).trim());
+                }
+                Err(e) => {
+                    self.scope_result = format!("无法打开选择器: {e}");
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.scope_result = "请在输入框手动输入项目目录路径".into();
+        }
+        cx.notify();
+    }
+
 
     /// 打开新增对话框。
     pub fn open_add(&mut self, cx: &mut Context<crate::app::SwitchApp>) {
@@ -152,15 +289,43 @@ impl McpPanel {
         let url = form.url.read(cx).text();
         let url = url.trim().to_string();
 
+        // Parse env and headers from raw text
+        let env: BTreeMap<String, String> = form.env_raw.read(cx).text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '=');
+                match (parts.next(), parts.next()) {
+                    (Some(k), Some(v)) if !k.trim().is_empty() && !v.trim().is_empty() => {
+                        Some((k.trim().to_string(), v.trim().to_string()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let headers: BTreeMap<String, String> = form.headers_raw.read(cx).text()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, ':');
+                match (parts.next(), parts.next()) {
+                    (Some(k), Some(v)) if !k.trim().is_empty() && !v.trim().is_empty() => {
+                        Some((k.trim().to_string(), v.trim().to_string()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+
         let server = match form.transport {
             McpTransport::Stdio => McpServer {
                 name: name.clone(),
                 transport: McpTransport::Stdio,
                 command: Some(command),
                 args,
-                env: BTreeMap::new(),
+                env,
                 url: None,
-                headers: BTreeMap::new(),
+                headers,
                 enabled: form.enabled,
             },
             McpTransport::Http | McpTransport::Sse | McpTransport::Ws => McpServer {
@@ -168,9 +333,9 @@ impl McpPanel {
                 transport: form.transport,
                 command: None,
                 args: Vec::new(),
-                env: BTreeMap::new(),
+                env,
                 url: Some(url),
-                headers: BTreeMap::new(),
+                headers,
                 enabled: form.enabled,
             },
         };
@@ -256,4 +421,115 @@ impl McpPanel {
         }
         cx.notify();
     }
+
+    /// 全部启用/禁用当前工具的全部 MCP 服务器。
+    pub fn set_all_enabled(&mut self, enabled: bool, cx: &mut Context<crate::app::SwitchApp>) {
+        if self.servers.is_empty() {
+            self.write_msg = "无服务器可操作".into();
+            cx.notify();
+            return;
+        }
+        let mut changed: Vec<McpServer> = Vec::new();
+        for s in &self.servers {
+            if s.enabled != enabled {
+                let mut c = s.clone();
+                c.enabled = enabled;
+                changed.push(c);
+            }
+        }
+        if changed.is_empty() {
+            self.write_msg = if enabled { "已全部启用".into() } else { "已全部禁用".into() };
+            cx.notify();
+            return;
+        }
+        let paths = McpPaths::from_env();
+        match manager::write_tool(self.tool, &paths, &[], &changed) {
+            Ok(_) => {
+                self.load(cx);
+                self.write_msg = if enabled {
+                    format!("已启用全部 {} 个服务器", changed.len())
+                } else {
+                    format!("已禁用全部 {} 个服务器", changed.len())
+                };
+            }
+            Err(e) => self.write_msg = format!("操作失败: {e}"),
+        }
+        cx.notify();
+    }
+
+    /// 从其他工具导入 MCP 服务器。
+    pub fn import_from(&mut self, source: Tool, cx: &mut Context<crate::app::SwitchApp>) {
+        if source == self.tool {
+            return;
+        }
+        let paths = McpPaths::from_env();
+        match manager::import_tool(source, &[self.tool], &paths) {
+            Ok(applied) if !applied.is_empty() => {
+                self.write_msg = format!("已从 {} 导入服务器", applied.join(", "));
+                self.load(cx);
+            }
+            Ok(_) => {
+                self.write_msg = "源工具无可用服务器".into();
+                cx.notify();
+            }
+            Err(e) => {
+                self.write_msg = format!("导入失败: {e}");
+                cx.notify();
+            }
+        }
+    }
+    }
+
+/// 从 Codex 项目级 `config.toml` 文本提取 `[mcp_servers.<name>]` 节名。
+///
+/// 纯函数（不读文件），供 `read_scope` 与测试复用。
+pub fn codex_project_mcp_names(text: &str) -> Vec<String> {
+    let mut servers = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("[mcp_servers.") {
+            if let Some(name) = rest.strip_suffix(']') {
+                let name = name.trim().trim_matches('"').trim();
+                if !name.is_empty() {
+                    servers.push(name.to_string());
+                }
+            }
+        }
+    }
+    servers.sort();
+    servers.dedup();
+    servers
 }
+
+#[cfg(test)]
+mod tests {
+    use super::codex_project_mcp_names;
+
+    #[test]
+    fn extracts_codex_project_mcp_names() {
+        let text = r#"
+[model_providers.anthropic]
+name = "Anthropic"
+
+[mcp_servers.fs]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp_servers."my server"]
+command = "uvx"
+args = ["mcp-server-fetch"]
+
+[other]
+x = 1
+"#;
+        let names = codex_project_mcp_names(text);
+        assert_eq!(names, vec!["fs", "my server"]);
+    }
+
+    #[test]
+    fn codex_project_mcp_names_empty() {
+        assert!(codex_project_mcp_names("model_provider = \"openai\"").is_empty());
+    }
+}
+
+

@@ -11,6 +11,15 @@
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod gemini;
+pub(crate) mod grok;
+pub(crate) mod opencode;
+pub(crate) mod kimi;
+pub(crate) mod openclaw;
+pub(crate) mod hermes;
+pub(crate) mod pi;
+pub(crate) mod minimax;
+pub(crate) mod omp;
+
 
 // 适配器以模块函数暴露（claude::/codex::/gemini:: 的 read/apply）。
 
@@ -64,12 +73,85 @@ impl McpPaths {
         dir.join("settings.json")
     }
 
+    /// OpenCode 用户配置（`~/.config/opencode/opencode.json`）。
+    pub fn opencode_config(&self) -> PathBuf {
+        let dir = std::env::var_os("OPENCODE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".config").join("opencode"));
+        dir.join("opencode.json")
+    }
+
+    /// Grok Build 用户配置（`~/.grok/config.toml`）。
+    pub fn grok_config(&self) -> PathBuf {
+        let dir = std::env::var_os("GROK_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".grok"));
+        dir.join("config.toml")
+    }
+
+    /// Kimi Code 用户配置（`~/.kimi-code/config.toml`）。
+    pub fn kimi_config(&self) -> PathBuf {
+        let dir = std::env::var_os("KIMI_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".kimi-code"));
+        dir.join("config.toml")
+    }
+
+    /// OpenClaw 用户配置（`~/.openclaw/openclaw.json`）。
+    pub fn openclaw_config(&self) -> PathBuf {
+        let dir = std::env::var_os("OPENCLAW_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".openclaw"));
+        dir.join("openclaw.json")
+    }
+
+    /// Hermes 用户配置（`~/.hermes/config.yaml`）。
+    pub fn hermes_config(&self) -> PathBuf {
+        let dir = std::env::var_os("HERMES_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".hermes"));
+        dir.join("config.yaml")
+    }
+
+    /// Pi 用户 MCP 配置（`~/.pi/agent/mcp.json`）。
+    pub fn pi_mcp(&self) -> PathBuf {
+        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".pi").join("agent"));
+        dir.join("mcp.json")
+    }
+
+    /// MiniMax Code 用户 MCP 配置（`~/.minimax/mcp.json`）。
+    pub fn minimax_mcp(&self) -> PathBuf {
+        let dir = std::env::var_os("MINIMAX_DATA_DIR")
+            .or_else(|| std::env::var_os("MAVIS_DATA_DIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".minimax"));
+        dir.join("mcp.json")
+    }
+
+    /// OMP 用户 MCP 配置（`~/.omp/agent/mcp.json`）。
+    pub fn omp_mcp(&self) -> PathBuf {
+        let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".omp").join("agent"));
+        dir.join("mcp.json")
+    }
+
     /// 某工具的 MCP 配置文件（用户作用域；无项目上下文）。
     pub fn config_for(&self, tool: Tool) -> Option<PathBuf> {
         match tool {
             Tool::Claude | Tool::ClaudeDesktop => Some(self.claude_user_json()),
             Tool::Codex => Some(self.codex_config()),
             Tool::Gemini => Some(self.gemini_settings()),
+            Tool::Opencode => Some(self.opencode_config()),
+            Tool::GrokBuild => Some(self.grok_config()),
+            Tool::Kimi => Some(self.kimi_config()),
+            Tool::Openclaw => Some(self.openclaw_config()),
+            Tool::Hermes => Some(self.hermes_config()),
+            Tool::Pi => Some(self.pi_mcp()),
+            Tool::Mcode => Some(self.minimax_mcp()),
+            Tool::Omp => Some(self.omp_mcp()),
             _ => None,
         }
     }

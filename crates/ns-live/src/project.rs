@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::floor;
 use super::json::{ClearScope, JsonPatch};
 use super::patch::KeyPath;
-use super::toml::{TomlPatch, item_from_json};
+use super::toml::{TomlClearScope, TomlPatch, item_from_json};
 use super::dotenv::EnvPatch;
 use super::yaml::{YamlListUpsert, YamlPatch};
 
@@ -131,6 +131,90 @@ pub fn gemini_env_entries(settings_config: &Value) -> Vec<(String, String)> {
     out
 }
 
+
+// ===========================================================================
+// Grok Build：`~/.grok/config.toml`。
+// ===========================================================================
+//
+// 官方格式：自定义模型用 `[model.<id>]` 表（base_url/api_key/name/model），
+// 默认模型用 `[models] default = "<id>"`。地板 = 我们写入的 `[model.*]` 条目
+// + `[models] default`。供应商行来自预设的 `env` 形状
+// （ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL），投影时转换。
+
+/// Grok Build 供应商条目的 TOML 段名（`[model.<id>]`）。
+fn grok_model_key(id: &str) -> String {
+    format!("model.{}", id)
+}
+
+/// 从 settings_config（`env` 形状）提取 Grok Build 端点/凭据/模型。
+fn grok_fields(cfg: &Value) -> (String, String, String) {
+    let s = |k: &str| {
+        cfg.get("env")
+            .and_then(|e| e.get(k))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    (
+        s("ANTHROPIC_BASE_URL"),
+        s("ANTHROPIC_AUTH_TOKEN"),
+        s("ANTHROPIC_MODEL"),
+    )
+}
+
+/// Grok Build `[model.<id>]` 条目（含名字与模型 id）。
+fn grok_model_item(id: &str, base: &str, key: &str, model: &str) -> toml_edit::Item {
+    item_from_json(&serde_json::json!({
+        "name": id,
+        "base_url": base,
+        "api_key": key,
+        "model": model,
+    }))
+}
+
+/// Grok Build：`~/.grok/config.toml`。
+///
+/// 地板 = 我们写过的 `[model.*]` 段 + `[models] default`。切换供应商时清掉旧
+/// 供应商条目，写入目标 `[model.<id>]`，并把 `[models] default` 指到它。
+pub fn grok_patch(id: &str, settings_config: &Value) -> TomlPatch {
+    let (base, key, model) = grok_fields(settings_config);
+    let mut patch = TomlPatch::default();
+
+    // 清掉上次写入的 `[model.<id>]` 段（地板：Grok 的 `[model.*]` 全部是
+    // 自定义模型端点表，切换供应商时归 ns-switch 管辖），保留用户自有段
+    // （`[models]`/`[ui]`/`[auth]` 等顶层表）。
+    patch.clear.push(TomlClearScope {
+        parent: KeyPath::from("model"),
+        is_floor: |_| true,
+    });
+
+    // 写入目标模型段。
+    patch.set.push((
+        KeyPath::from(grok_model_key(id).as_str()),
+        grok_model_item(id, &base, &key, &model),
+    ));
+    // 默认模型指向该段。
+    patch.set.push((
+        KeyPath::from("models").child("default"),
+        item_from_json(&serde_json::json!(id)),
+    ));
+    patch
+}
+
+/// 路由模式下 Grok Build `config.toml` 补丁：`[model.<id>]` 指向本地代理。
+pub fn grok_routing_patch(id: &str, port: u16) -> TomlPatch {
+    let base = format!("http://{ROUTING_HOST}:{port}");
+    let mut patch = TomlPatch::default();
+    patch.set.push((
+        KeyPath::from(grok_model_key(id).as_str()),
+        grok_model_item(id, &base, ROUTING_PLACEHOLDER_KEY, id),
+    ));
+    patch.set.push((
+        KeyPath::from("models").child("default"),
+        item_from_json(&serde_json::json!(id)),
+    ));
+    patch
+}
 // ===========================================================================
 // 共存式工具（additive）：把供应商 upsert 进工具自身配置，工具内再选。
 // 补丁只动该供应商的条目，不删其他供应商、不碰用户自有字段。
@@ -501,5 +585,66 @@ mod routing_tests {
         assert_eq!(env.set[0], ("GEMINI_BASE_URL".into(), "http://127.0.0.1:8901".into()));
         assert_eq!(env.set[1].0, "GEMINI_API_KEY");
         assert_eq!(env.set[1].1, "ns-switch-routing");
+    }
+
+    #[test]
+    fn grok_patch_writes_model_table_and_default() {
+        let cfg = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.grok.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "sk-grok",
+                "ANTHROPIC_MODEL": "grok-4.5",
+            }
+        });
+        let patch = grok_patch("grok-test", &cfg);
+        let (mut doc, _) = crate::toml::parse(
+            std::path::Path::new("x"),
+            Some(b"[models]\ndefault = \"old\"\n[model.old]\nbase_url = \"https://old\"\n"),
+        )
+        .unwrap();
+        patch.apply_to(std::path::Path::new("x"), &mut doc).unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("[model.grok-test]"), "写入模型段: {text}");
+        assert!(text.contains("base_url = \"https://api.grok.example.com\""));
+        assert!(text.contains("api_key = \"sk-grok\""));
+        assert!(text.contains("model = \"grok-4.5\""));
+        assert!(text.contains("default = \"grok-test\""), "默认模型指向新段");
+        assert!(!text.contains("[model.old]"), "旧供应商段被清掉");
+    }
+
+    #[test]
+    fn grok_patch_keeps_user_tables() {
+        let cfg = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.grok.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "sk-grok",
+                "ANTHROPIC_MODEL": "grok-4.5",
+            }
+        });
+        let patch = grok_patch("grok-test", &cfg);
+        let (mut doc, _) = crate::toml::parse(
+            std::path::Path::new("x"),
+            Some(b"[ui]\nsimple_mode = true\n[models]\ndefault = \"old\"\n"),
+        )
+        .unwrap();
+        patch.apply_to(std::path::Path::new("x"), &mut doc).unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("simple_mode = true"), "用户自有段保留: {text}");
+        assert!(text.contains("default = \"grok-test\""));
+    }
+
+    #[test]
+    fn grok_routing_points_at_localhost() {
+        let patch = grok_routing_patch("grok-routing", 8902);
+        let (mut doc, _) = crate::toml::parse(
+            std::path::Path::new("x"),
+            Some(b"[models]\ndefault = \"old\"\n"),
+        )
+        .unwrap();
+        patch.apply_to(std::path::Path::new("x"), &mut doc).unwrap();
+        let text = doc.to_string();
+        assert!(text.contains("base_url = \"http://127.0.0.1:8902\""));
+        assert!(text.contains("api_key = \"ns-switch-routing\""));
+        assert!(text.contains("default = \"grok-routing\""));
     }
 }

@@ -77,6 +77,19 @@ impl PromptPaths {
             .unwrap_or_else(|| self.home.clone());
         root.join(".gemini").join("GEMINI.md")
     }
+
+
+    /// Pi（oh-my-pi）用户级追加提示文件（`~/.omp/agent/APPEND_SYSTEM.md`）。
+    ///
+    /// 追加语义：保留默认指令模板，用户条目追加到渲染后提示末尾。
+    /// `PI_CONFIG_DIR` 覆盖配置目录名（同 `.omp` 基准）。
+    pub fn omp_user(&self) -> PathBuf {
+        let dir = std::env::var_os("PI_CONFIG_DIR")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".omp"));
+        dir.join("agent").join("APPEND_SYSTEM.md")
+    }
 }
 
 #[cfg(test)]

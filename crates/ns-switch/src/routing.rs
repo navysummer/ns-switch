@@ -12,11 +12,17 @@ use ns_proxy::Upstream;
 pub struct RunningProxy {
     pub port: u16,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// 共享熔断器表（读状态展示；与 ProxyConfig 共享）。
+    pub breakers: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<usize, ns_proxy::CircuitBreaker>>,
+    >,
 }
 
 /// 每工具代理运行时。
 #[derive(Default)]
 pub struct RoutingRuntime {
+    /// 共享请求日志（所有代理写入，UI 读取）。
+    pub request_log: std::sync::Arc<ns_proxy::RequestLog>,
     proxies: BTreeMap<Tool, RunningProxy>,
 }
 
@@ -43,16 +49,31 @@ impl RoutingRuntime {
         upstreams: Vec<Upstream>,
         model_routes: Option<std::collections::HashMap<String, usize>>,
         listen_addr: &str,
+        failover_enabled: bool,
+        breaker_threshold: u32,
+        breaker_cooldown_secs: u32,
     ) -> anyhow::Result<u16> {
         if let Some(p) = self.proxies.get_mut(&tool) {
             return Ok(p.port);
         }
+        let log = self.request_log.clone();
+        let tool_id = tool.id_str().to_string();
         let config = match model_routes {
             Some(routes) => {
-                ns_proxy::ProxyConfig::with_queue(upstreams).with_model_routes(routes)
+                ns_proxy::ProxyConfig::with_queue(upstreams)
+                    .with_model_routes(routes)
+                    .with_failover(failover_enabled)
+                    .with_log(log, tool_id)
+                    .with_breaker(breaker_threshold, breaker_cooldown_secs)
             }
-            None => ns_proxy::ProxyConfig::with_queue(upstreams),
+            None => {
+                ns_proxy::ProxyConfig::with_queue(upstreams)
+                    .with_failover(failover_enabled)
+                    .with_log(log, tool_id)
+                    .with_breaker(breaker_threshold, breaker_cooldown_secs)
+            }
         };
+        let breakers = config.breakers.clone();
         let bind_addr = format!("{listen_addr}:0");
         let (listener, addr) = ns_proxy::bind(bind_addr.parse()?).await?;
         let port = addr.port();
@@ -63,9 +84,26 @@ impl RoutingRuntime {
             RunningProxy {
                 port,
                 shutdown: Some(tx),
+                breakers,
             },
         );
         Ok(port)
+    }
+
+    /// 某工具各上游的熔断状态（index → state）。未运行时返回空。
+    pub fn breaker_states(&self, tool: Tool) -> Vec<(usize, ns_proxy::CircuitState)> {
+        let Some(p) = self.proxies.get(&tool) else {
+            return Vec::new();
+        };
+        let mut states: Vec<(usize, ns_proxy::CircuitState)> = p
+            .breakers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(i, b)| (*i, b.state()))
+            .collect();
+        states.sort_by_key(|(i, _)| *i);
+        states
     }
 
     /// 停止某工具代理。
@@ -117,6 +155,12 @@ pub fn provider_upstream(tool: Tool, provider: &Provider) -> Option<Upstream> {
             let env = cfg.get("env")?;
             let base = env.get("GEMINI_BASE_URL")?.as_str()?;
             let key = env.get("GEMINI_API_KEY").and_then(|v| v.as_str()).unwrap_or("");
+            Some(Upstream::new(base.to_string(), key.to_string()).with_format(fmt))
+        }
+        Tool::GrokBuild => {
+            let env = cfg.get("env")?;
+            let base = env.get("ANTHROPIC_BASE_URL")?.as_str()?;
+            let key = env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()).unwrap_or("");
             Some(Upstream::new(base.to_string(), key.to_string()).with_format(fmt))
         }
         _ => None,
@@ -202,12 +246,29 @@ mod tests {
         assert_eq!(u.api_key, "sk-g");
     }
 
+    #[test]
+    fn grok_upstream_extraction() {
+        let p = Provider::with_id(
+            "grok-test".into(),
+            "88API".into(),
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.88api.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-grok",
+                }
+            }),
+        );
+        let u = provider_upstream(Tool::GrokBuild, &p).unwrap();
+        assert_eq!(u.base_url, "https://api.88api.com");
+        assert_eq!(u.api_key, "sk-grok");
+    }
+
     #[tokio::test]
     async fn runtime_starts_stops_proxy() {
         let mut rt = RoutingRuntime::new();
         let upstream = Upstream::new("http://127.0.0.1:9", "sk"); // 无需可达，仅生命周期。
         let port = rt
-            .ensure_running_with(Tool::Claude, vec![upstream], None, "127.0.0.1")
+            .ensure_running_with(Tool::Claude, vec![upstream], None, "127.0.0.1", true, 3, 30)
             .await
             .unwrap();
         assert!(port > 0);
@@ -220,6 +281,9 @@ mod tests {
                 vec![Upstream::new("http://127.0.0.1:9", "sk")],
                 None,
                 "127.0.0.1",
+                true,
+                3,
+                30,
             )
             .await
             .unwrap();
@@ -235,6 +299,9 @@ mod tests {
                 vec![Upstream::new("http://127.0.0.1:9", "sk")],
                 None,
                 "127.0.0.1",
+                true,
+                3,
+                30,
             )
             .await
             .unwrap();

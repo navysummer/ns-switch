@@ -3,7 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use gpui::{
-    Context, Div, FocusHandle, KeyBinding, Render, Stateful, div, prelude::*, px, rgb,
+    Context, Div, FocusHandle, KeyBinding, Render, Stateful, div, prelude::*, px, rgb, Hsla,
     actions,
 };
 use ns_presets::Tool;
@@ -25,6 +25,12 @@ actions!(
         TogglePage3,
         TogglePage4,
         TogglePage5,
+        TogglePage6,
+        TogglePage7,
+        TogglePage8,
+        EscapeDialog,
+        FocusProviderSearch,
+        SaveCurrent,
     ]
 );
 
@@ -41,6 +47,14 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-4", TogglePage3, None),
         KeyBinding::new("cmd-5", TogglePage4, None),
         KeyBinding::new("cmd-6", TogglePage5, None),
+        KeyBinding::new("cmd-f", FocusProviderSearch, None),
+        KeyBinding::new("ctrl-f", FocusProviderSearch, None),
+        KeyBinding::new("cmd-7", TogglePage6, None),
+        KeyBinding::new("cmd-8", TogglePage7, None),
+        KeyBinding::new("cmd-9", TogglePage8, None),
+        KeyBinding::new("escape", EscapeDialog, None),
+        KeyBinding::new("cmd-s", SaveCurrent, None),
+        KeyBinding::new("ctrl-s", SaveCurrent, None),
     ]
 }
 
@@ -66,12 +80,12 @@ impl Render for DragGhost {
             .px(px(10.))
             .py(px(6.))
             .rounded(px(8.))
-            .bg(theme::color(theme::PANEL_SOLID))
+            .bg(theme::panel())
             .border_1()
-            .border_color(theme::alpha(theme::STROKE, 0.4))
+            .border_color(theme::stroke_a(0.4))
             .shadow_lg()
             .text_size(px(11.))
-            .text_color(rgb(theme::TEXT))
+            .text_color(theme::text())
             .child(self.label.clone())
     }
 }
@@ -113,26 +127,6 @@ impl Page {
         Page::ToolConfig,
         Page::Settings,
     ];
-
-
-    fn label(self) -> &'static str {
-        match self {
-            Page::Providers => "供应商",
-            Page::Routing => "路由",
-            Page::Mcp => "MCP",
-            Page::Skills => "Skills",
-            Page::Prompts => "提示词",
-            Page::Usage => "用量",
-            Page::Tools => "工具",
-            Page::Projects => "项目",
-            Page::Sessions => "会话",
-            Page::Accounts => "账号",
-            Page::Apps => "应用",
-            Page::Universal => "通用",
-            Page::ToolConfig => "工具配置",
-            Page::Settings => "设置",
-        }
-    }
 }
 
 /// Page → i18n key（侧栏翻译用）。
@@ -155,6 +149,134 @@ fn page_i18n_key(page: Page) -> &'static str {
     }
 }
 
+/// token 数格式化（>1M 显示 M，>1k 显示 k，否则原样）。
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// 合并两组按日统计（同日期累加），按日期排序。
+fn merge_daily(
+    a: Vec<ns_usage::DailyCount>,
+    b: Vec<ns_usage::DailyCount>,
+) -> Vec<ns_usage::DailyCount> {
+    let mut map: std::collections::BTreeMap<String, ns_usage::DailyCount> = std::collections::BTreeMap::new();
+    for d in a.into_iter().chain(b) {
+        let e = map.entry(d.date.clone()).or_insert(ns_usage::DailyCount {
+            date: d.date.clone(),
+            ..Default::default()
+        });
+        e.requests += d.requests;
+        e.input_tokens += d.input_tokens;
+        e.output_tokens += d.output_tokens;
+    }
+    map.into_values().collect()
+}
+
+/// 合并两组请求明细（拼接后按时间新→旧排序）。
+fn merge_details(
+    mut a: Vec<ns_usage::RequestDetail>,
+    b: Vec<ns_usage::RequestDetail>,
+) -> Vec<ns_usage::RequestDetail> {
+    a.extend(b);
+    a.sort_by_key(|d| std::cmp::Reverse(d.ts_ms));
+    a
+}
+
+/// Page → 侧栏图标字形（纯文本，后续可换 SVG）。
+fn page_glyph(page: Page) -> &'static str {
+    match page {
+        Page::Providers => "▤",
+        Page::Routing => "⇄",
+        Page::Mcp => "⛁",
+        Page::Skills => "✦",
+        Page::Prompts => "✎",
+        Page::Usage => "▥",
+        Page::Tools => "⌬",
+        Page::Projects => "▦",
+        Page::Sessions => "☰",
+        Page::Accounts => "◉",
+        Page::Apps => "▦",
+        Page::Universal => "◈",
+        Page::ToolConfig => "⚙",
+        Page::Settings => "⚙",
+    }
+}
+
+/// 供应商页模式视图（cc-switch 对应 direct/route/stack 三格）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderMode {
+    Direct,
+    Route,
+    Stack,
+}
+
+impl ProviderMode {
+    fn label(self) -> &'static str {
+        match self {
+            ProviderMode::Direct => "直连",
+            ProviderMode::Route => "路由",
+            ProviderMode::Stack => "聚合",
+        }
+    }
+}
+
+/// 状态栏语义色：中性默认（就绪/加载）、成功（玉色）、错误（朱色）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusTone {
+    Neutral,
+    Success,
+    Error,
+}
+
+impl StatusTone {
+    pub fn color(&self) -> Hsla {
+        match self {
+            StatusTone::Neutral => theme::text_dim(),
+            StatusTone::Success => theme::jade(),
+            StatusTone::Error => theme::danger(),
+        }
+    }
+}
+
+/// 设置页分区（对齐 cc-switch SettingsSection）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsSection {
+    General,
+    AppConfig,
+    Routing,
+    Network,
+    Data,
+    About,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 6] = [
+        SettingsSection::General,
+        SettingsSection::AppConfig,
+        SettingsSection::Routing,
+        SettingsSection::Network,
+        SettingsSection::Data,
+        SettingsSection::About,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsSection::General => "通用",
+            SettingsSection::AppConfig => "应用配置",
+            SettingsSection::Routing => "路由",
+            SettingsSection::Network => "网络",
+            SettingsSection::Data => "数据",
+            SettingsSection::About => "关于",
+        }
+    }
+}
+
 
 /// 应用状态。
 pub struct SwitchApp {
@@ -163,6 +285,13 @@ pub struct SwitchApp {
     pub(crate) page: Page,
     pub(crate) sidebar_visible: bool,
     pub(crate) status: String,
+    /// 状态栏语义色（中性默认、成功玉色、错误朱色）。
+    pub(crate) status_tone: StatusTone,
+    pub(crate) switch_conflicts: Vec<String>,
+    /// 待用户确认的切换请求（存在写入冲突时暂存；确认后强制执行）。
+    pub(crate) pending_switch: Option<(Tool, ns_presets::Provider, String)>,
+    /// 启动时扫描到的遗留冲突（用户尚未处理），用于启动横幅展示。
+    pub(crate) startup_conflicts: Vec<String>,
     pub(crate) focus_handle: FocusHandle,
     pub(crate) open_menu: Option<String>,
     pub(crate) add_open: bool,
@@ -171,8 +300,14 @@ pub struct SwitchApp {
     pub(crate) edit_id: Option<String>,
     /// 待确认删除的供应商 id（None = 无）。
     pub(crate) confirm_delete: Option<String>,
+    /// 复制供应商后的高亮反馈（新副本卡片短暂高亮；None = 无）。
+    pub(crate) copied_provider: Option<String>,
+    /// 连通性测试结果（provider id → (成功, 摘要)）。健康芯片显示依据。
+    pub(crate) health: std::collections::BTreeMap<String, (bool, String)>,
 
     pub(crate) dialog_fields: dialog::DialogFields,
+    /// 对话框表单是否有未保存更改（用于关闭守卫）。
+    pub(crate) dialog_dirty: bool,
     pub(crate) dialog_inputs: dialog::DialogInputs,
     /// 供应商页搜索输入。
     pub(crate) provider_search: gpui::Entity<crate::text_field::TextField>,
@@ -188,6 +323,9 @@ pub struct SwitchApp {
     pub(crate) tray: Option<std::sync::Arc<tray::Tray>>,
     /// 托盘菜单/点击事件接收端（共享给后台轮询任务）。
     pub(crate) tray_rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<tray::TrayAction>>>,
+    /// 单实例深链接收端（后台监听线程转发；None = 未启用单实例）。
+    pub(crate) deeplink_rx:
+        Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>>,
     /// 主窗口句柄（托盘“打开主窗口”用；共享给后台轮询任务）。
     pub(crate) window_handle:
         std::sync::Arc<std::sync::Mutex<Option<gpui::WindowHandle<SwitchApp>>>>,
@@ -214,6 +352,12 @@ pub struct SwitchApp {
     /// 请求明细（新→旧）。
 
     pub(crate) usage_details: Vec<ns_usage::RequestDetail>,
+    /// 按日统计（按工具拆分：key = tool id_str）。用于用量图表按工具筛选。
+    pub(crate) usage_daily_by_tool: std::collections::BTreeMap<String, Vec<ns_usage::DailyCount>>,
+    /// 用量图表包含的工具（key = tool id_str；空 = 全部）。
+    pub(crate) usage_chart_tools: std::collections::BTreeMap<String, bool>,
+    /// 用量图表日期范围（天数；0 = 全部）。对齐 cc-switch UsageDateRangePicker。
+    pub(crate) usage_range_days: usize,
     /// M10 会话列表。
     pub(crate) sessions: Vec<ns_sessions::SessionMeta>,
     /// 会话页搜索输入。
@@ -222,6 +366,8 @@ pub struct SwitchApp {
     pub(crate) session_delete: Option<String>,
     /// 会话加载中。
     pub(crate) sessions_loading: bool,
+    /// 会话来源工具（Claude/Codex）。
+    pub(crate) session_tool: ns_sessions::SessionTool,
     /// 正在阅读的会话路径（None = 列表）。
     pub(crate) session_viewing: Option<String>,
     /// 阅读会话的分轮消息。
@@ -235,8 +381,9 @@ pub struct SwitchApp {
     pub(crate) session_filter: gpui::Entity<crate::text_field::TextField>,
     /// M11 工具扫描结果（工具, 安装）。
     pub(crate) tools_result: Vec<(ns_tools::Tool, Option<ns_tools::ToolInstall>)>,
-    /// 工具扫描中。
     pub(crate) tools_scanning: bool,
+    /// 工具安装/卸载结果消息。
+    pub(crate) tool_msg: String,
     /// 项目快照新项目名输入。
     pub(crate) project_name: gpui::Entity<crate::text_field::TextField>,
     /// 自动更新检查结果（None = 未检查）。
@@ -248,6 +395,33 @@ pub struct SwitchApp {
     pub(crate) sync_pass: gpui::Entity<crate::text_field::TextField>,
     /// 云同步状态。
     pub(crate) sync_status: String,
+    /// 云同步提供方（webdav / s3）。
+    pub(crate) sync_provider: String,
+    /// S3 bucket。
+    pub(crate) sync_bucket: gpui::Entity<crate::text_field::TextField>,
+    /// 自动同步间隔（分钟）。
+    pub(crate) sync_interval: gpui::Entity<crate::text_field::TextField>,
+    pub(crate) price_model: gpui::Entity<crate::text_field::TextField>,
+    pub(crate) price_input: gpui::Entity<crate::text_field::TextField>,
+    pub(crate) price_output: gpui::Entity<crate::text_field::TextField>,
+    pub(crate) price_cache: gpui::Entity<crate::text_field::TextField>,
+    /// 自定义定价操作状态。
+    pub(crate) pricing_status: String,
+    /// 全局出站代理 URL 输入。
+    pub(crate) global_proxy_url: gpui::Entity<crate::text_field::TextField>,
+    /// 全局代理操作状态（保存/测试/扫描反馈）。
+    pub(crate) proxy_status: String,
+    /// 全局代理测试结果（(成功, 延迟毫秒, 错误)）。
+    pub(crate) proxy_test: Option<(bool, u64, Option<String>)>,
+    /// 扫描到的本地代理（(URL, 协议, 端口)）。
+    pub(crate) proxy_scan: Vec<(String, String, u16)>,
+    pub(crate) provider_mode: ProviderMode,
+    /// 每工具配置目录覆盖输入（key = 工具 `id_str()`）。
+    pub(crate) config_dir_inputs: std::collections::BTreeMap<String, gpui::Entity<crate::text_field::TextField>>,
+    /// 配置目录覆盖操作状态。
+    pub(crate) config_dir_status: String,
+    /// 设置页当前分区。
+    pub(crate) settings_section: SettingsSection,
     /// 通用供应商对话框打开。
     pub(crate) universal_open: bool,
     /// 正在编辑的通用供应商 id（None = 添加）。
@@ -266,10 +440,41 @@ pub struct SwitchApp {
     pub(crate) toolconfig_editor: Option<gpui::Entity<crate::text_area::TextArea>>,
     /// 工具配置保存状态文本。
     pub(crate) toolconfig_status: String,
+    /// OpenClaw 每日记忆文件列表。
+    pub(crate) daily_memory_files: Vec<crate::toolconfig::DailyMemoryFile>,
+    /// 正在编辑的每日记忆文件名。
+    pub(crate) daily_memory_editing: Option<String>,
+    /// 每日记忆编辑器输入实体。
+    pub(crate) daily_memory_editor: Option<gpui::Entity<crate::text_area::TextArea>>,
+    /// 每日记忆保存状态文本。
+    pub(crate) daily_memory_status: String,
+    /// 待确认删除的每日记忆文件名。
+    pub(crate) daily_memory_confirm_delete: Option<String>,
+    /// OpenClaw agents.defaults 结构化编辑打开。
+    pub(crate) openclaw_defaults_open: bool,
+    /// 正在编辑的 agents.defaults 字段。
+    pub(crate) oc_defaults: crate::toolconfig::OpenClawAgentsDefaults,
+    /// agents.defaults 编辑输入实体。
+    pub(crate) oc_defaults_inputs: crate::toolconfig::OpenClawDefaultsInputs,
+    /// agents.defaults 保存状态文本。
+    pub(crate) oc_defaults_status: String,
+    /// 首次运行欢迎页是否显示。
+    pub(crate) welcome_visible: bool,
+    /// 更新说明（WhatsNew）浮层是否显示。
+    pub(crate) whats_new_visible: bool,
+    /// 待确认的深链导入动作（action + 脱敏摘要；None = 无）。
+    pub(crate) deeplink_pending:
+        Option<(crate::deeplink::DeepLinkAction, String)>,
+    /// 进行中的 OAuth device-code 登录（provider + session + 账号 id + 显示名）。
+    pub(crate) oauth_login:
+        Option<(String, crate::auth::DeviceCodeSession, String, String)>,
 }
 
 impl SwitchApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        deeplink_rx: Option<std::sync::mpsc::Receiver<String>>,
+    ) -> Self {
         let store = Arc::new(RwLock::new(
             Store::open().unwrap_or_else(|e| {
                 eprintln!("打开存储失败，使用默认: {e}");
@@ -279,25 +484,50 @@ impl SwitchApp {
                 })
             }),
         ));
+        // 同步全局主题（P1-1：light/system 实际应用）。
+        let init_mode = theme::ThemeMode::parse(
+            &store
+                .read()
+                .map(|s| s.config().settings.theme.clone())
+                .unwrap_or_else(|_| "dark".into()),
+        );
+        ns_ui::theme::set_active_mode(init_mode);
+        let welcome_visible = !store
+            .read()
+            .map(|s| s.config().settings.welcome_dismissed)
+            .unwrap_or(false);
+        // WhatsNew：上次版本非空且不同于当前版本 → 显示更新说明。
+        let last_seen = store
+            .read()
+            .map(|s| s.config().settings.last_seen_version.clone())
+            .unwrap_or_default();
+        let whats_new_visible = !last_seen.is_empty() && last_seen != crate::update::CURRENT_VERSION;
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
         crate::tray::register_event_handler(tray_tx);
         let tray = Self::build_tray(store.clone());
         let tray_rx = std::sync::Arc::new(std::sync::Mutex::new(tray_rx));
         let window_handle = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let app = Self {
-            store,
+        let mut app = Self {
+            store: store.clone(),
             active_tool: Tool::Claude,
             page: Page::Providers,
             sidebar_visible: true,
             status: "就绪".into(),
+            status_tone: StatusTone::Neutral,
+            switch_conflicts: Vec::new(),
+            pending_switch: None,
+            startup_conflicts: Vec::new(),
             focus_handle: cx.focus_handle(),
             open_menu: None,
             add_open: false,
             dialog_preset: None,
             edit_id: None,
             confirm_delete: None,
+            copied_provider: None,
+            health: std::collections::BTreeMap::new(),
 
             dialog_fields: dialog::DialogFields::default(),
+            dialog_dirty: false,
             dialog_inputs: dialog::DialogInputs::new(cx),
             provider_search: cx.new(|cx| crate::text_field::TextField::new("搜索供应商…", cx)),
             drag_provider: None,
@@ -306,6 +536,8 @@ impl SwitchApp {
             routing_status: Default::default(),
             tray,
             tray_rx: tray_rx.clone(),
+            deeplink_rx: deeplink_rx
+                .map(|rx| std::sync::Arc::new(std::sync::Mutex::new(rx))),
 
             window_handle: window_handle.clone(),
             mcp: crate::mcp::McpPanel::new(cx),
@@ -318,10 +550,14 @@ impl SwitchApp {
             session_scanning: false,
             usage_daily: Vec::new(),
             usage_details: Vec::new(),
+            usage_daily_by_tool: Default::default(),
+            usage_chart_tools: Default::default(),
+            usage_range_days: 30,
             sessions: Vec::new(),
             session_search: cx.new(|cx| crate::text_field::TextField::new("搜索会话…", cx)),
             session_delete: None,
             sessions_loading: false,
+            session_tool: ns_sessions::SessionTool::Claude,
             session_viewing: None,
             session_rounds: Vec::new(),
             session_meta: None,
@@ -329,12 +565,29 @@ impl SwitchApp {
             session_filter: cx.new(|cx| crate::text_field::TextField::new("会话内搜索…", cx)),
             tools_result: Vec::new(),
             tools_scanning: false,
+            tool_msg: String::new(),
             project_name: cx.new(|cx| crate::text_field::TextField::new("项目名…", cx)),
             update_status: None,
             sync_url: cx.new(|cx| crate::text_field::TextField::new("WebDAV URL…", cx)),
             sync_user: cx.new(|cx| crate::text_field::TextField::new("用户名…", cx)),
             sync_pass: cx.new(|cx| crate::text_field::TextField::new("密码…", cx)),
             sync_status: String::new(),
+            sync_provider: "webdav".into(),
+            sync_bucket: cx.new(|cx| crate::text_field::TextField::new("S3 bucket（S3 用）", cx)),
+            sync_interval: cx.new(|cx| crate::text_field::TextField::new("自动同步间隔（分钟，0=关）", cx)),
+            price_model: cx.new(|cx| crate::text_field::TextField::new("模型前缀（如 claude-sonnet-4-5）", cx)),
+            price_input: cx.new(|cx| crate::text_field::TextField::new("输入 $/1M", cx)),
+            price_output: cx.new(|cx| crate::text_field::TextField::new("输出 $/1M", cx)),
+            price_cache: cx.new(|cx| crate::text_field::TextField::new("缓存读 $/1M（可选）", cx)),
+            pricing_status: String::new(),
+            global_proxy_url: cx.new(|cx| crate::text_field::TextField::new("http://127.0.0.1:7890", cx)),
+            proxy_status: String::new(),
+            proxy_test: None,
+            proxy_scan: Vec::new(),
+            provider_mode: ProviderMode::Direct,
+            config_dir_inputs: Default::default(),
+            config_dir_status: String::new(),
+            settings_section: SettingsSection::General,
             universal_open: false,
             universal_edit: None,
             universal_confirm_delete: None,
@@ -344,14 +597,46 @@ impl SwitchApp {
             toolconfig_id: None,
             toolconfig_editor: None,
             toolconfig_status: String::new(),
+            daily_memory_files: Vec::new(),
+            daily_memory_editing: None,
+            daily_memory_editor: None,
+            daily_memory_status: String::new(),
+            daily_memory_confirm_delete: None,
+            openclaw_defaults_open: false,
+            oc_defaults: Default::default(),
+            oc_defaults_inputs: crate::toolconfig::OpenClawDefaultsInputs::new(cx),
+            oc_defaults_status: String::new(),
+            welcome_visible,
+            whats_new_visible,
+            deeplink_pending: None,
+            oauth_login: None,
         };
+        // 记录本次版本（供下次启动 WhatsNew 检测）。
+        if let Ok(mut s) = store.write() {
+            let _ = s.set_last_seen_version(crate::update::CURRENT_VERSION);
+        }
+        // 回填全局出站代理到输入框，并应用进程级代理环境（curl/git 子进程继承）。
+        {
+            let proxy = store
+                .read()
+                .map(|s| s.config().settings.global_proxy().map(|p| p.to_string()))
+                .unwrap_or(None);
+            if let Some(p) = proxy.as_deref() {
+                app.global_proxy_url.update(cx, |f, _cx| f.set_text(p));
+                unsafe {
+                    for (k, v) in crate::proxy_env::curl_env(p) {
+                        std::env::set_var(k, v);
+                    }
+                }
+            }
+        }
         // 深链导入：启动时处理 `nsswitch://`（env 或命令行参数）。
         let deeplink = std::env::var("NS_SWITCH_DEEPLINK")
             .ok()
             .or_else(|| std::env::args().nth(1).filter(|a| a.starts_with("nsswitch://")));
         if let Some(url) = deeplink {
             if let Some(action) = crate::deeplink::parse(&url) {
-                app.apply_deeplink(&action);
+                app.apply_deeplink(&action, cx);
             }
         }
         // 后台轮询托盘事件：窗口最小化/关闭后 render 不再运行，需独立消费。
@@ -389,12 +674,129 @@ impl SwitchApp {
             }
         })
         .detach();
+        // 后台轮询单实例转发的深链 URL（窗口最小化时 render 不运行）。
+        let deeplink_rx = app.deeplink_rx.clone();
+        if let Some(rx) = deeplink_rx {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let urls: Vec<String> = {
+                        let rx = rx.lock().unwrap();
+                        let mut v = Vec::new();
+                        while let Ok(u) = rx.try_recv() {
+                            v.push(u);
+                        }
+                        v
+                    };
+                    for url in urls {
+                        if let Some(action) = crate::deeplink::parse(&url) {
+                            this.update(cx, |this, cx| this.apply_deeplink(&action, cx))
+                                .ok();
+                        }
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(250))
+                        .await;
+                }
+            })
+            .detach();
+        }
+        // 启动后台定期自动检查更新（启动后 3 秒首次检查，此后每 6 小时循环；
+        // 不阻塞，发现新版写入 update_status 供设置页显示）。
+        cx.spawn(async move |this, cx| {
+            loop {
+                // 延迟：首次 3 秒，之后 6 小时。
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                let result = crate::update::check_update();
+                if let Some(v) = result {
+                    this.update(cx, |this, cx| {
+                        if this.update_status.is_none() {
+                            this.update_status = Some(Ok(format!("发现新版本 {v}")));
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+                // 等待下一个周期（6 小时）。
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(6 * 3600))
+                    .await;
+            }
+        })
+        .detach();
+        // 启动后台定期自动同步（按 settings.sync.auto_sync_minutes；0 = 关闭）。
+        let sync_store = app.store.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let minutes = {
+                    let s = sync_store.read().expect("store lock");
+                    s.config().settings.sync.auto_sync_minutes
+                };
+                if minutes == 0 {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(60))
+                        .await;
+                    continue;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(minutes as u64 * 60))
+                    .await;
+                let r = {
+                    let s = sync_store.read().expect("store lock");
+                    if s.config().settings.sync.enabled {
+                        s.sync_push()
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(e) = r {
+                    this.update(cx, |this, cx| {
+                        this.sync_status = format!("自动同步失败: {e}");
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+        // 启动后异步扫描所有工具的遗留配置冲突，在供应商页首屏提示用户。
+        let scan_store = app.store.clone();
+        cx.spawn(async move |this, _cx| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let conflicts: Vec<String> = if let Some(h) = &home {
+                let mut out = Vec::new();
+                let s = scan_store.read().expect("store lock");
+                for tool in Tool::ALL.iter() {
+                    let cfg = s.config();
+                    if let Some(current_id) = cfg.current.get(*tool) {
+                        if let Some(current_provider) = cfg.providers.get(current_id) {
+                            let cfs = crate::switch_engine::check_conflicts(
+                                *tool, current_provider, None, h
+                            );
+                            for c in cfs {
+                                out.push(format!("{}：{}", c.path.display(), c.reason));
+                            }
+                        }
+                    }
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            this.update(_cx, |this, _| {
+                if !conflicts.is_empty() {
+                    this.startup_conflicts = conflicts;
+                }
+            }).ok();
+        })
+        .detach();
         app
     }
 
     /// 从存储快照构建托盘（含初始菜单）。
     fn build_tray(store: Arc<RwLock<Store>>) -> Option<std::sync::Arc<tray::Tray>> {
-        let entries = tray_entries(&store);
+        let entries = tray_entries(&store, &std::collections::BTreeMap::new());
         match tray::Tray::new(&entries) {
             Ok(t) => Some(std::sync::Arc::new(t)),
             Err(e) => {
@@ -443,7 +845,7 @@ impl SwitchApp {
     /// 供应商集合变化后重建托盘菜单。
     pub(crate) fn refresh_tray_menu(&mut self, cx: &mut Context<Self>) {
         if let Some(tray) = &self.tray {
-            let entries = tray_entries(&self.store);
+            let entries = tray_entries(&self.store, &self.usage);
             if let Err(e) = tray.rebuild_menu(&entries) {
                 eprintln!("托盘菜单重建失败: {e}");
             }
@@ -452,8 +854,118 @@ impl SwitchApp {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        // 从存储重新加载（M4 起真正读写；当前为占位，保持就绪）
-        self.status = "就绪".into();
+        // 按当前页分发真实刷新（cmd-r）：用量页重查统计+各工具用量、会话页重扫、供应商页重绘重读。
+        match self.page {
+            Page::Usage => {
+                self.refresh_session_stats(cx);
+                for &tool in Tool::ALL.iter() {
+                    self.query_usage(tool, cx);
+                }
+                self.status = "用量已刷新".into();
+            }
+            Page::Sessions => {
+                self.load_sessions(cx);
+                self.status = "会话已刷新".into();
+            }
+            _ => {
+                self.status = "已刷新".into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 保存全局出站代理：写 settings + 应用/清除进程级代理环境（curl/git 继承）。
+    fn save_global_proxy(&mut self, cx: &mut Context<Self>) {
+        let url = self.global_proxy_url.read(cx).text().trim().to_string();
+        if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("socks") {
+            self.proxy_status = "代理 URL 需以 http://、https:// 或 socks5:// 开头".into();
+            self.status_tone = StatusTone::Error;
+            cx.notify();
+            return;
+        }
+        let env = crate::proxy_env::curl_env(&url);
+        {
+            let mut s = self.store.write().expect("store lock");
+            let _ = s.set_global_proxy(&url);
+        }
+        // 应用/清除进程级代理环境。
+        unsafe {
+            for (k, _) in crate::proxy_env::curl_env("x") {
+                std::env::remove_var(k);
+            }
+            for (k, v) in env {
+                std::env::set_var(k, v);
+            }
+        }
+        self.proxy_test = None;
+        self.proxy_status = if url.is_empty() {
+            "已清除全局代理（直连）".into()
+        } else {
+            format!("已保存全局代理：{url}")
+        };
+        self.status_tone = StatusTone::Success;
+        cx.notify();
+    }
+
+    /// 保存某工具的配置目录覆盖（空 = 恢复默认）。
+    fn save_config_dir(&mut self, tool: ns_presets::Tool, cx: &mut Context<Self>) {
+        let Some(e) = self.config_dir_inputs.get(tool.id_str()) else {
+            return;
+        };
+        let dir = e.read(cx).text().trim().to_string();
+        let result = {
+            let mut s = self.store.write().expect("store lock");
+            s.set_config_dir(tool, &dir)
+        };
+        self.config_dir_status = match result {
+            Ok(()) => {
+                if dir.is_empty() {
+                    format!("{} 配置目录已恢复默认", tool.label())
+                } else {
+                    format!("{} 配置目录已设为 {dir}", tool.label())
+                }
+            }
+            Err(e) => format!("保存失败: {e}"),
+        };
+        self.status_tone = if self.config_dir_status.contains("失败") {
+            StatusTone::Error
+        } else {
+            StatusTone::Success
+        };
+        cx.notify();
+    }
+
+    /// 测试全局代理连接（后台 curl 经代理请求公共端点）。
+    fn test_global_proxy(&mut self, cx: &mut Context<Self>) {
+        let url = self.global_proxy_url.read(cx).text().trim().to_string();
+        self.proxy_status = "正在测试代理…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (ok, ms, err) = crate::proxy_env::test_proxy(&url);
+            this.update(cx, |this, cx| {
+                this.proxy_test = Some((ok, ms, err.clone()));
+                this.proxy_status = if ok {
+                    format!("代理可用（{ms}ms）")
+                } else {
+                    format!("代理不可用：{}", err.unwrap_or_default())
+                };
+                this.status_tone = if ok { StatusTone::Success } else { StatusTone::Error };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 扫描本地常见代理端口。
+    fn scan_proxies(&mut self, cx: &mut Context<Self>) {
+        let found = crate::proxy_env::scan_local_proxies();
+        self.proxy_scan = found.clone();
+        self.proxy_status = if found.is_empty() {
+            "未发现本地代理".into()
+        } else {
+            format!("发现 {} 个本地代理", found.len())
+        };
         cx.notify();
     }
 
@@ -465,42 +977,71 @@ impl SwitchApp {
 
     fn select_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
+        // 进入 Sessions 页即自动加载会话列表（否则首屏空态，需手动点「刷新」）。
+        if page == Page::Sessions && self.sessions.is_empty() && !self.sessions_loading {
+            self.load_sessions(cx);
+        }
+        // MCP/Skills/Prompts 面板进入即预加载当前工具（否则首屏空态）。
+        if page == Page::Mcp && self.mcp.servers.is_empty() {
+            self.mcp.load(cx);
+        }
+        if page == Page::Skills && self.skills.skills.is_empty() {
+            self.skills.shared = self
+                .store
+                .read()
+                .map(|s| s.config().settings.shared_skills)
+                .unwrap_or(false);
+            self.skills.load(cx);
+        }
+        if page == Page::Prompts && self.prompts.entries.is_empty() {
+            self.prompts.load(cx);
+        }
+        if page == Page::ToolConfig && self.daily_memory_files.is_empty() {
+            self.daily_memory_files = crate::toolconfig::list_daily_memory();
+        }
         cx.notify();
     }
 
-    fn render_topbar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_topbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .h(px(48.))
+            .h(px(44.))
             .px(px(14.))
             .flex()
             .items_center()
             .justify_between()
-            .bg(theme::color(theme::BG_1).opacity(0.78))
+            .bg(theme::bg_1().opacity(0.78))
             .border_b_1()
-            .border_color(theme::alpha(theme::STROKE, 0.1))
+            .border_color(theme::stroke_a(0.1))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .child(widgets::brand_mark(26.))
+                    .gap(px(8.))
+                    .child(widgets::brand_mark(22.))
                     .child(
                         div()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(gpui::FontWeight::BOLD)
-
-                                    .text_color(rgb(theme::TEXT))
-                                    .child("商量切换器"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.5))
-                                    .text_color(rgb(theme::TEXT_FAINT))
-                                    .child("ns-switch · 一键切换 API 供应商"),
-                            ),
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("ns-switch"),
+                    )
+                    .child(
+                        div()
+                            .id("topbar-collapse")
+                            .cursor_pointer()
+                            .size(px(26.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .hover(|s| s.bg(theme::stroke_a(0.08)))
+                            .child(if self.sidebar_visible { "«" } else { "»" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_visible = !this.sidebar_visible;
+                                cx.notify();
+                            })),
                     ),
             )
             .when(
@@ -517,7 +1058,7 @@ impl SwitchApp {
                             .child(widgets::section_label("项目"))
                             .child(
                                 widgets::ghost_button("top-project", "切换项目…")
-                                    .on_click(_cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, _, cx| {
                                         this.open_menu = Some("project".to_string());
                                         cx.notify();
                                     })),
@@ -525,23 +1066,10 @@ impl SwitchApp {
                     )
                 },
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(widgets::section_label("工具"))
-                    .child(
-                        widgets::ghost_button("top-add", "＋ 添加供应商")
-                            .on_click(_cx.listener(|this, _, _, cx| {
-                                this.status = "添加供应商（M3 实现）".into();
-                                cx.notify();
-                            })),
-                    ),
-            )
     }
 
-    fn render_sidebar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    /// 侧栏（cc-switch v7 布局）：顶条 → 应用列表滚动区 → 分隔线 → 全局页面项（贴底）→ 分隔线 → 底栏（应用/设置）。
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let lang = crate::i18n::Lang::parse(
             &self
                 .store
@@ -549,15 +1077,60 @@ impl SwitchApp {
                 .map(|s| s.config().settings.language.clone())
                 .unwrap_or_else(|_| "zh-cn".into()),
         );
+        // 全局页面项（cc-switch MainDirectory 的 globals：MCP/Skills/Prompts/Usage/Sessions 等）。
+        const GLOBAL_PAGES: [Page; 11] = [
+            Page::Routing,
+            Page::Tools,
+            Page::Mcp,
+            Page::Skills,
+            Page::Prompts,
+            Page::Usage,
+            Page::Sessions,
+            Page::Projects,
+            Page::Accounts,
+            Page::Universal,
+            Page::ToolConfig,
+        ];
+        // 当前生效模式缓存（每工具：路由/聚合/直连）。
+        let store = self.store.read().expect("store lock");
+        let tools = store
+            .tool_order()
+            .into_iter()
+            .filter(|&t| store.tool_visible(t))
+            .collect::<Vec<_>>();
+        let mut mode_map = std::collections::BTreeMap::new();
+        let mut usage_map = std::collections::BTreeMap::new();
+        for &t in &tools {
+            let rc = store.config().settings.routing_for(t);
+            let agg = store.config().aggregation_for(t);
+            mode_map.insert(
+                t.id_str().to_string(),
+                if rc.enabled {
+                    ProviderMode::Route
+                } else if agg.enabled {
+                    ProviderMode::Stack
+                } else {
+                    ProviderMode::Direct
+                },
+            );
+            if let Some(u) = self.usage.get(t.id_str()) {
+                if u.remaining.is_some() || u.total.is_some() {
+                    usage_map.insert(t.id_str().to_string(), u.clone());
+                }
+            }
+        }
+        drop(store);
+
         div()
-            .w(px(212.))
+            .w(px(200.))
             .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .bg(theme::color(theme::BG_1).opacity(0.56))
+            .bg(theme::bg_1().opacity(0.56))
             .border_r_1()
-            .border_color(theme::alpha(theme::STROKE, 0.1))
+            .border_color(theme::stroke_a(0.1))
+            // 顶条
             .child(
                 div()
                     .h(px(36.))
@@ -566,124 +1139,268 @@ impl SwitchApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(widgets::section_label("AI 工具"))
                     .child(
                         div()
                             .text_size(px(9.5))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child(format!("{} 个", Tool::ALL.len())),
+                            .text_color(theme::text_faint())
+                            .child(format!("{} 个", tools.len())),
                     ),
             )
+            // 应用列表（唯一滚动区）
             .child(
                 div()
                     .id("tool-list")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .py(px(6.))
                     .px(px(6.))
                     .flex()
                     .flex_col()
-                    .children(Tool::ALL.into_iter().enumerate().map(|(i, tool)| {
-                        let active = tool == self.active_tool;
+                    .children({
+                        tools.into_iter().enumerate().map(|(i, tool)| {
+                            let active = tool == self.active_tool;
+                            let mode = mode_map.get(tool.id_str()).copied().unwrap_or(ProviderMode::Direct);
+                            let usage = usage_map.get(tool.id_str()).cloned();
+                            div()
+                                .id(("tool-item", i))
+                                .h(px(30.))
+                                .px(px(8.))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .rounded(px(6.))
+                                .bg(if active {
+                                    theme::accent_a(0.12)
+                                } else {
+                                    theme::alpha(0xffffff, 0.0)
+                                })
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::stroke_a(0.07)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_tool(tool, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .w(px(18.))
+                                        .text_size(px(12.))
+                                        .text_color(rgb(if active {
+                                            theme::ACCENT
+                                        } else {
+                                            theme::TEXT_FAINT
+                                        }))
+                                        .child(tool.glyph()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .text_size(px(11.5))
+                                        .text_color(if active {
+                                            theme::text()
+                                        } else {
+                                            theme::text_dim()
+                                        })
+                                        .child(tool.label()),
+                                )
+                                .child(if !active {
+                                    // 模式状态标签（对齐 cc-switch AppNavItem modeTag）。
+                                    match mode {
+                                        ProviderMode::Route => widgets::pill("路由", theme::jade()),
+                                        ProviderMode::Stack => widgets::pill("聚合", theme::accent()),
+                                        ProviderMode::Direct => div(),
+                                    }
+                                } else {
+                                    div()
+                                })
+                                .child(if let Some(u) = usage {
+                                    // 用量尾注（对齐 cc-switch 今日用量）。
+                                    let mut line = String::new();
+                                    let unit = if u.unit.is_empty() { String::new() } else { format!(" {}", u.unit) };
+                                    let currency = u.currency.as_deref().unwrap_or("");
+                                    if let Some(total) = u.total {
+                                        line.push_str(&format!("{total}{unit}{currency}"));
+                                    } else if let Some(rem) = u.remaining {
+                                        line.push_str(&format!("剩 {rem}{unit}{currency}"));
+                                    }
+                                    if !line.is_empty() {
+                                        div()
+                                            .text_size(px(9.))
+                                            .text_color(theme::text_faint())
+                                            .child(line)
+                                    } else {
+                                        div()
+                                    }
+                                } else {
+                                    div()
+                                })
+                        })
+                    }),
+            )
+            // 分隔线
+            .child(
+                div()
+                    .h(px(1.))
+                    .flex_shrink_0()
+                    .mx(px(10.))
+                    .my(px(4.))
+                    .bg(theme::stroke_a(0.1)),
+            )
+            // 全局页面项（贴底）
+            .child(
+                div()
+                    .flex_none()
+                    .flex_col()
+                    .children(GLOBAL_PAGES.into_iter().enumerate().map(|(i, page)| {
+                        let active = page == self.page;
                         div()
-                            .id(("tool-item", i))
+                            .id(("page-item", i))
+                            .h(px(26.))
+                            .px(px(8.))
+                            .mx(px(4.))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .rounded(px(6.))
+                            .bg(if active {
+                                theme::accent_a(0.12)
+                            } else {
+                                theme::alpha(0xffffff, 0.0)
+                            })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::stroke_a(0.07)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_page(page, cx);
+                            }))
+                            .child(
+                                div()
+                                    .w(px(18.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if active {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::TEXT_FAINT
+                                    }))
+                                    .child(page_glyph(page)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(if active {
+                                        theme::text()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .child(crate::i18n::t(lang, page_i18n_key(page))),
+                            )
+                    })),
+            )
+            // 分隔线
+            .child(
+                div()
+                    .h(px(1.))
+                    .flex_shrink_0()
+                    .mx(px(10.))
+                    .my(px(4.))
+                    .bg(theme::stroke_a(0.1)),
+            )
+            // 底栏：应用管理 + 设置
+            .child(
+                div()
+                    .h(px(38.))
+                    .px(px(8.))
+                    .pb(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .id(("page-item", 99usize))
+                            .flex_1()
                             .h(px(28.))
                             .px(px(8.))
                             .flex()
                             .items_center()
                             .gap(px(8.))
                             .rounded(px(6.))
-                            .bg(if active {
-                                theme::alpha(theme::ACCENT, 0.12)
+                            .bg(if self.page == Page::Apps {
+                                theme::accent_a(0.12)
                             } else {
                                 theme::alpha(0xffffff, 0.0)
                             })
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme::alpha(theme::STROKE, 0.07)))
-                            .on_click(_cx.listener(move |this, _, _, cx| {
-                                this.select_tool(tool, cx);
+                            .hover(|style| style.bg(theme::stroke_a(0.07)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.select_page(Page::Apps, cx);
                             }))
                             .child(
                                 div()
                                     .w(px(18.))
-                                    .text_size(px(12.))
-                                    .text_color(rgb(if active {
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if self.page == Page::Apps {
                                         theme::ACCENT
                                     } else {
                                         theme::TEXT_FAINT
                                     }))
-                                    .child(tool.glyph()),
+                                    .child("▦"),
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_size(px(11.5))
-                                    .text_color(if active {
-                                        rgb(theme::TEXT)
+                                    .text_size(px(11.))
+                                    .text_color(if self.page == Page::Apps {
+                                        theme::text()
                                     } else {
-                                        rgb(theme::TEXT_DIM)
+                                        theme::text_dim()
                                     })
-                                    .child(tool.label()),
-                            )
-                            .child(if tool.is_switch() {
-                                widgets::pill("切换", theme::color(theme::JADE))
-                            } else {
-                                widgets::pill("共存", theme::color(theme::ACCENT))
-                            })
-                    })),
-            )
-            .child(
-                div()
-                    .h(px(40.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
-                    .child(widgets::section_label("页面"))
+                                    .child(crate::i18n::t(lang, page_i18n_key(Page::Apps))),
+                            ),
+                    )
                     .child(
                         div()
+                            .id(("page-item", 100usize))
+                            .flex_1()
+                            .h(px(28.))
+                            .px(px(8.))
                             .flex()
                             .items_center()
-                            .gap(px(4.))
-                            .children(Page::ALL.into_iter().enumerate().map(|(i, page)| {
-                                let active = page == self.page;
+                            .gap(px(8.))
+                            .rounded(px(6.))
+                            .bg(if self.page == Page::Settings {
+                                theme::accent_a(0.12)
+                            } else {
+                                theme::alpha(0xffffff, 0.0)
+                            })
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::stroke_a(0.07)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.select_page(Page::Settings, cx);
+                            }))
+                            .child(
                                 div()
-                                    .id(("page-item", i))
-                                    .h(px(24.))
-                                    .px(px(8.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(6.))
-                                    .bg(if active {
-                                        theme::alpha(theme::ACCENT, 0.12)
+                                    .w(px(18.))
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if self.page == Page::Settings {
+                                        theme::ACCENT
                                     } else {
-                                        theme::alpha(0xffffff, 0.0)
-                                    })
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme::alpha(theme::STROKE, 0.07)))
-                                    .on_click(_cx.listener(move |this, _, _, cx| {
-                                        this.select_page(page, cx);
+                                        theme::TEXT_FAINT
                                     }))
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(if active {
-                                                rgb(theme::ACCENT)
-                                            } else {
-                                                rgb(theme::TEXT_DIM)
-                                            })
-                                            .child(crate::i18n::t(
-                                                lang,
-                                                page_i18n_key(page),
-                                            )),
-                                    )
-                            })),
+                                    .child("⚙"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(if self.page == Page::Settings {
+                                        theme::text()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .child(crate::i18n::t(lang, page_i18n_key(Page::Settings))),
+                            ),
                     ),
             )
     }
@@ -715,30 +1432,49 @@ impl SwitchApp {
             .h_full()
             .flex()
             .flex_col()
+            // 页头（cc-switch AppPageHeader：高 52，左图标+标题+副标题，右操作区）
             .child(
                 div()
-                    .h(px(42.))
-                    .px(px(16.))
+                    .h(px(52.))
+                    .px(px(20.))
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(20.))
                     .border_b_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(px(10.))
+                            .child(
+                                // 工具图标（对齐 AppPageHeader icon）
+                                div()
+                                    .size(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.))
+                                    .text_color(theme::accent())
+                                    .child(self.active_tool.glyph()),
+                            )
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(15.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(self.active_tool.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::text_faint())
+                                    .child("供应商"),
                             )
                             .child(widgets::pill(
                                 if self.active_tool.is_switch() { "切换" } else { "共存" },
-                                theme::color(theme::JADE),
+                                theme::jade(),
                             )),
                     )
                     .child(
@@ -748,21 +1484,8 @@ impl SwitchApp {
                             .gap(px(10.))
                             .child(
                                 div()
-                                    .w(px(200.))
-                                    .h(px(30.))
-                                    .px(px(10.))
-                                    .rounded(px(8.))
-                                    .bg(theme::alpha(0x000000, 0.25))
-                                    .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.14))
-                                    .flex()
-                                    .items_center()
-                                    .child(self.provider_search.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_faint())
                                     .child(format!("{} 个供应商", providers.len())),
                             )
                             .child(
@@ -774,7 +1497,7 @@ impl SwitchApp {
                                     .on_click(cx.listener(Self::import_providers)),
                             )
                             .child(
-                                widgets::ghost_button("page-add", "＋ 添加供应商")
+                                widgets::primary_button("page-add", "＋ 添加供应商")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.add_open = true;
                                         cx.notify();
@@ -782,6 +1505,49 @@ impl SwitchApp {
                             ),
                     ),
             )
+            .child(self.render_provider_mode_tabs(cx))
+            .when(!self.switch_conflicts.is_empty() || !self.startup_conflicts.is_empty(), |el| {
+                let mut text = String::new();
+                if !self.startup_conflicts.is_empty() {
+                    text.push_str(&format!("启动扫描（{}）：{}", self.startup_conflicts.len(), self.startup_conflicts.join("；")));
+                }
+                if !self.switch_conflicts.is_empty() {
+                    if !text.is_empty() {
+                        text.push_str(" | ");
+                    }
+                    text.push_str(&format!("切换检测（{}）：{}", self.switch_conflicts.len(), self.switch_conflicts.join("；")));
+                }
+                el.child(
+                    div()
+                        .mx(px(16.))
+                        .mt(px(10.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .rounded(px(8.))
+                        .bg(theme::danger().opacity(0.12))
+                        .border_1()
+                        .border_color(theme::danger().opacity(0.35))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme::danger())
+                                .child(text),
+                        )
+                        .child(
+                            widgets::ghost_button("dismiss-conflict", "忽略").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.switch_conflicts.clear();
+                                    this.startup_conflicts.clear();
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("provider-scroll")
@@ -799,39 +1565,159 @@ impl SwitchApp {
                         this.drop_target = None;
                         cx.notify();
                     }))
-                    .children(if providers.is_empty() {
-                        vec![self.render_empty_state(cx).into_any_element()]
+                    .child(
+                        // 列表首行：分区标题（左）+ 搜索框（右），对齐 cc-switch searchField
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_dim())
+                                    .child(if providers.is_empty() {
+                                        "无供应商".to_string()
+                                    } else {
+                                        "全部供应商".to_string()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(200.))
+                                    .h(px(30.))
+                                    .px(px(10.))
+                                    .rounded(px(8.))
+                                    .bg(theme::alpha(0x000000, 0.25))
+                                    .border_1()
+                                    .border_color(theme::stroke_a(0.14))
+                                    .flex()
+                                    .items_center()
+                                    .child(self.provider_search.clone()),
+                            ),
+                    )
+                    .child(if providers.is_empty() {
+                        self.render_empty_state(cx).into_any_element()
                     } else {
-                        providers
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| {
-                                let p = p.clone();
-                                let drag_info = ProviderDrag { id: p.id.clone() };
-                                self.render_provider_card(i, p.clone(), cx)
-                                    .on_drag(drag_info, |info, position, _, cx| {
-                                        let label = info.id.clone();
-                                        cx.new(|_| DragGhost {
-                                            label,
-                                            offset: position,
-                                        })
+                        div()
+                            .flex_col()
+                            .gap(px(10.))
+                            .children(
+                                providers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, p)| {
+                                        let p = p.clone();
+                                        let drag_info = ProviderDrag { id: p.id.clone() };
+                                        self.render_provider_card(i, p.clone(), cx)
+                                            .on_drag(drag_info, |info, position, _, cx| {
+                                                let label = info.id.clone();
+                                                cx.new(|_| DragGhost {
+                                                    label,
+                                                    offset: position,
+                                                })
+                                            })
+                                            .on_drag_move(
+                                                cx.listener(
+                                                    move |this,
+                                                          ev: &gpui::DragMoveEvent<ProviderDrag>,
+                                                          _,
+                                                          cx| {
+                                                        let id = ev.drag(cx).id.clone();
+                                                        this.drop_target = Some(id);
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .into_any_element()
                                     })
-                                    .on_drag_move(
-                                        cx.listener(
-                                            move |this,
-                                                  ev: &gpui::DragMoveEvent<ProviderDrag>,
-                                                  _,
-                                                  cx| {
-                                                let id = ev.drag(cx).id.clone();
-                                                this.drop_target = Some(id);
-                                                cx.notify();
-                                            },
-                                        ),
-                                    )
-                                    .into_any_element()
+                                    .collect::<Vec<_>>(),
+                            )
+                            .into_any_element()
+                    })
+            )
+    }
+
+    /// 供应商页模式标签（直连/路由/聚合，对齐 cc-switch ModeTabs）。
+    fn render_provider_mode_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tool = self.active_tool;
+        let supports_stack = tool.supports_aggregation();
+        let modes: Vec<ProviderMode> = if supports_stack {
+            vec![ProviderMode::Direct, ProviderMode::Route, ProviderMode::Stack]
+        } else {
+            vec![ProviderMode::Direct, ProviderMode::Route]
+        };
+        // 当前生效模式（从配置读取）。
+        let route_active = self
+            .store
+            .read()
+            .map(|s| s.config().settings.routing_for(tool).enabled)
+            .unwrap_or(false);
+        let stack_active = self
+            .store
+            .read()
+            .map(|s| s.config().aggregation_for(tool).enabled)
+            .unwrap_or(false);
+        let active_mode = if route_active {
+            ProviderMode::Route
+        } else if stack_active {
+            ProviderMode::Stack
+        } else {
+            ProviderMode::Direct
+        };
+
+        div()
+            .px(px(16.))
+            .py(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .children(modes.into_iter().enumerate().map(|(i, mode)| {
+                        let selected = self.provider_mode == mode;
+                        let is_active = active_mode == mode;
+                        div()
+                            .id(("provider-mode", i))
+                            .px(px(14.))
+                            .h(px(30.))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .rounded(px(8.))
+                            .cursor_pointer()
+                            .bg(if selected {
+                                theme::accent_a(0.18)
+                            } else {
+                                theme::surface_a(0.4)
                             })
-                            .collect()
-                    }),
+                            .border_1()
+                            .border_color(if selected {
+                                theme::accent_a(0.5)
+                            } else {
+                                theme::stroke_a(0.1)
+                            })
+                            .text_color(if selected {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .text_size(px(12.))
+                            .child(mode.label())
+                            .child(if is_active {
+                                widgets::status_dot(theme::jade(), 6.)
+                            } else {
+                                div()
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.provider_mode = mode;
+                                cx.notify();
+                            }))
+                    })),
             )
     }
 
@@ -944,7 +1830,7 @@ impl SwitchApp {
             };
             if let Some(path) = path {
                 let json = std::fs::read_to_string(&path);
-                this.update(cx, |this, cx| {
+                this.update(cx, |this, _cx| {
                     let result = match json {
                         Ok(text) => this
                             .store
@@ -953,11 +1839,12 @@ impl SwitchApp {
                             .import_providers(tool, &text),
                         Err(e) => Err(anyhow::anyhow!("读取失败: {e}")),
                     };
+                    let is_ok = result.is_ok();
                     this.status = match result {
                         Ok(n) => format!("已导入 {n} 个供应商"),
                         Err(e) => format!("导入失败: {e}"),
                     };
-                    cx.notify();
+                    this.status_tone = if is_ok { StatusTone::Success } else { StatusTone::Error };
                 })
                 .ok();
             }
@@ -999,7 +1886,7 @@ impl SwitchApp {
         current_provider: Option<&ns_presets::Provider>,
         cx: &mut Context<Self>,
     ) {
-        // 写入前冲突检测：目标 live 文件被手动改动/他方占用 → 告警。
+        // 写入前冲突检测：目标 live 文件被手动改动/他方占用 → 暂停并请求确认。
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let conflicts = home
             .as_deref()
@@ -1007,17 +1894,34 @@ impl SwitchApp {
                 crate::switch_engine::check_conflicts(tool, provider, current_provider, h)
             })
             .unwrap_or_default();
-        let conflict_note = if conflicts.is_empty() {
-            String::new()
-        } else {
-            let first = &conflicts[0];
-            format!(
-                " ⚠ {} 处配置被占用/修改（{}：{}）",
+        self.switch_conflicts = conflicts
+            .iter()
+            .map(|c| format!("{}：{}", c.path.display(), c.reason))
+            .collect();
+        if !conflicts.is_empty() {
+            // 存在冲突：暂存切换请求，等待用户确认（确认后强制执行）。
+            let note = format!(
+                "{} 处配置被占用/修改（{}：{}）",
                 conflicts.len(),
-                first.path.display(),
-                first.reason
-            )
-        };
+                conflicts[0].path.display(),
+                conflicts[0].reason
+            );
+            self.pending_switch = Some((tool, provider.clone(), note));
+            self.status = format!("检测到写入冲突（{}），请确认是否继续", conflicts.len());
+            self.status_tone = StatusTone::Error;
+            cx.notify();
+            return;
+        }
+        self.apply_switch(tool, provider, cx);
+    }
+
+    /// 实际执行切换（写入 live 配置 + 更新 current）。冲突确认后也走此路径。
+    fn apply_switch(
+        &mut self,
+        tool: Tool,
+        provider: &ns_presets::Provider,
+        cx: &mut Context<Self>,
+    ) {
         let backup_dir = self.store.read().expect("store lock").backups_dir();
         match crate::switch_engine::switch_to(tool, provider, &backup_dir) {
             Ok(outcome) => {
@@ -1033,19 +1937,20 @@ impl SwitchApp {
                             "；已热切换（下次命令生效）".to_string()
                         };
                         format!(
-                            "已切换到 {}（写入 {} 个文件{}）{}{}",
+                            "已切换到 {}（写入 {} 个文件{}）{}",
                             provider.name,
                             outcome.written,
                             if outcome.noop { "，无内容变化" } else { "" },
                             restart_hint,
-                            conflict_note
                         )
                     }
                     Err(e) => format!("切换失败: {e}"),
                 };
+                self.status_tone = StatusTone::Success;
             }
             Err(e) => {
                 self.status = format!("切换失败: {e}");
+                self.status_tone = StatusTone::Error;
             }
         }
         cx.notify();
@@ -1097,6 +2002,13 @@ impl SwitchApp {
             provider
         };
         self.write_provider(tool, &provider, current_provider.as_ref(), cx);
+        if tool == Tool::Codex {
+            self.status = format!(
+                "{}；Codex 聚合已写入：请完全重启 Codex（所有终端/CLI/桌面应用共用后台 daemon，需重启后新模型列表才生效）",
+                self.status
+            );
+            cx.notify();
+        }
     }
 
     /// 写 Codex 聚合模型目录（合并所有聚合供应商可见模型），返回目录文件路径。
@@ -1130,15 +2042,71 @@ impl SwitchApp {
 
     /// 查询某工具当前供应商的用量（异步执行脚本）。
     fn query_usage(&mut self, tool: Tool, cx: &mut Context<Self>) {
-        let script = {
+
+        // Gemini 官方订阅：优先走 Cloud Code RPC 配额查询（需 OAuth token）。
+        if tool == Tool::Gemini {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let token = home
+                .as_deref()
+                .and_then(ns_usage::read_gemini_access_token);
+            if let Some(token) = token {
+                self.usage_loading
+                    .insert(tool.id_str().to_string(), true);
+                cx.notify();
+                let tool_id = tool.id_str().to_string();
+                cx.spawn(async move |this, cx| {
+                    let result = ns_usage::query_gemini_quota(&token);
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(tiers) => {
+                                this.usage.insert(
+                                    tool_id.clone(),
+                                    ns_usage::gemini_quota_to_usage(&tiers),
+                                );
+                            }
+                            Err(e) => {
+                                this.usage.insert(
+                                    tool_id.clone(),
+                                    ns_usage::Usage {
+                                        source: format!("Gemini 配额查询失败: {e}"),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                        }
+                        this.usage_loading.remove(&tool_id);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+        }
+        let (script, usage_enabled) = {
             let store = self.store.read().expect("store lock");
             let cfg = store.config();
-            cfg.current
-                .get(tool)
-                .and_then(|id| cfg.providers.get(id))
+            let p = cfg.current.get(tool).and_then(|id| cfg.providers.get(id));
+            let script = p
                 .and_then(|p| p.meta.as_ref())
-                .and_then(|m| m.usage_script.clone())
+                .and_then(|m| m.usage_script.clone());
+            let enabled = p
+                .and_then(|p| p.meta.as_ref())
+                .map(|m| m.usage_enabled)
+                .unwrap_or(true);
+            (script, enabled)
         };
+        if !usage_enabled {
+            self.usage.insert(
+                tool.id_str().to_string(),
+                ns_usage::Usage {
+                    source: "用量查询已停用".into(),
+                    ..Default::default()
+                },
+            );
+            cx.notify();
+            return;
+        }
         let Some(script) = script else {
             self.usage.insert(
                 tool.id_str().to_string(),
@@ -1187,24 +2155,190 @@ impl SwitchApp {
         .detach();
     }
 
-    /// 扫描 Claude Code 会话日志，统计按模型请求/token。
+    /// 从定价表单添加/覆盖自定义模型定价。
+    fn add_custom_price(&mut self, cx: &mut Context<Self>) {
+        let model = self.price_model.read(cx).text().trim().to_string();
+        if model.is_empty() {
+            self.pricing_status = "请输入模型前缀".into();
+            cx.notify();
+            return;
+        }
+        let parse = |f: &gpui::Entity<crate::text_field::TextField>| -> Option<f64> {
+            let t = f.read(cx).text().trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<f64>().ok()
+            }
+        };
+        let Some(input) = parse(&self.price_input) else {
+            self.pricing_status = "请输入有效输入价".into();
+            cx.notify();
+            return;
+        };
+        let Some(output) = parse(&self.price_output) else {
+            self.pricing_status = "请输入有效输出价".into();
+            cx.notify();
+            return;
+        };
+        let cache = parse(&self.price_cache);
+        let ok = {
+            let mut s = self.store.write().expect("store lock");
+            s.set_custom_price(&model, input, output, cache).is_ok()
+        };
+        self.pricing_status = if ok {
+            format!("已设置 {model} 定价")
+        } else {
+            "保存定价失败".into()
+        };
+        // 清空表单。
+        self.price_input.update(cx, |f, _| f.set_text(""));
+        self.price_output.update(cx, |f, _| f.set_text(""));
+        self.price_cache.update(cx, |f, _| f.set_text(""));
+        cx.notify();
+    }
+
+    /// 从 models.dev API 拉取定价并批量写入自定义定价表。
+    fn import_models_dev_pricing(&mut self, cx: &mut Context<Self>) {
+        self.pricing_status = "正在从 models.dev 拉取定价…".into();
+        cx.notify();
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let result = ns_usage::import_models_dev();
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(map) => {
+                        let mut store_w = store.write().expect("store lock");
+                        let mut count = 0usize;
+                        for (model, price) in &map {
+                            let _ = store_w.set_custom_price(
+                                model,
+                                price.input_per_mtok,
+                                price.output_per_mtok,
+                                price.cache_read_per_mtok,
+                            );
+                            count += 1;
+                        }
+                        drop(store_w);
+                        this.pricing_status =
+                            format!("已从 models.dev 导入 {count} 条模型定价");
+                    }
+                    Err(e) => {
+                        this.pricing_status = format!("导入失败: {e}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 扫描 Claude Code + Codex 会话日志，统计按模型请求/token。
     fn refresh_session_stats(&mut self, cx: &mut Context<Self>) {
         self.session_scanning = true;
         cx.notify();
+        // 自定义定价表（settings.custom_pricing 的 JSON → CustomPrice）。
+        let custom: std::collections::BTreeMap<String, ns_usage::CustomPrice> = {
+            let g = self.store.read().ok();
+            g.map(|g| {
+                let c = g.config().settings.custom_pricing.clone();
+                c.iter()
+                    .filter_map(|(k, v)| {
+                        let input = v.get("input_per_mtok").and_then(|x| x.as_f64())?;
+                        let output = v.get("output_per_mtok").and_then(|x| x.as_f64())?;
+                        let cache = v.get("cache_read_per_mtok").and_then(|x| x.as_f64());
+                        Some((k.clone(), ns_usage::CustomPrice::new(input, output, cache)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        };
+        let this_usage_range = self.usage_range_days;
         cx.spawn(async move |this, cx| {
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            let (stats, daily, details) = match home.as_deref() {
-                Some(h) => (
-                    ns_usage::scan_claude_sessions(h, 0),
-                    ns_usage::scan_claude_daily(h, 30),
-                    ns_usage::scan_claude_details(h),
-                ),
-                None => (Vec::new(), Vec::new(), Vec::new()),
+
+            let (stats, daily, details, by_tool) = match home.as_deref() {
+                Some(h) => {
+                    let mut s = ns_usage::scan_claude_sessions(h, 0);
+                    // Codex 统计合并进同一列表（按模型聚合）。
+                    for cs in ns_usage::scan_codex_sessions(h, 0) {
+                        if let Some(existing) = s.iter_mut().find(|e| e.model == cs.model) {
+                            existing.requests += cs.requests;
+                            existing.input_tokens += cs.input_tokens;
+                            existing.output_tokens += cs.output_tokens;
+                            existing.cache_read_tokens += cs.cache_read_tokens;
+                            // 花费按合并后 token 重算。
+                            existing.cost_usd = ns_usage::cost_with_custom(
+                                &existing.model,
+                                existing.input_tokens,
+                                existing.output_tokens,
+                                existing.cache_read_tokens,
+                                &custom,
+                            );
+                        } else {
+                            s.push(cs);
+                        }
+                    }
+                    // Gemini 统计合并（Claude/Codex 列表同模型聚合）。
+                    for gs in ns_usage::scan_gemini_sessions(h, 0) {
+                        if let Some(existing) = s.iter_mut().find(|e| e.model == gs.model) {
+                            existing.requests += gs.requests;
+                            existing.input_tokens += gs.input_tokens;
+                            existing.output_tokens += gs.output_tokens;
+                            existing.cache_read_tokens += gs.cache_read_tokens;
+                            existing.cost_usd = ns_usage::cost_with_custom(
+                                &existing.model,
+                                existing.input_tokens,
+                                existing.output_tokens,
+                                existing.cache_read_tokens,
+                                &custom,
+                            );
+                        } else {
+                            s.push(gs);
+                        }
+                    }
+                    s.sort_by(|a, b| b.requests.cmp(&a.requests));
+                    let range = this_usage_range;
+                    let claude_daily = ns_usage::scan_claude_daily(h, range);
+                    let codex_daily = ns_usage::scan_codex_daily(h, range);
+                    let gemini_daily = ns_usage::scan_gemini_daily(h, range);
+                    let by_tool = {
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert("claude".to_string(), claude_daily.clone());
+                        m.insert("codex".to_string(), codex_daily.clone());
+                        m.insert("gemini".to_string(), gemini_daily.clone());
+                        m
+                    };
+                    (
+                        s,
+                        merge_daily(
+                            merge_daily(claude_daily, codex_daily),
+                            gemini_daily,
+                        ),
+                        merge_details(
+                            merge_details(
+                                ns_usage::scan_claude_details(h),
+                                ns_usage::scan_codex_details(h),
+                            ),
+                            ns_usage::scan_gemini_details(h),
+                        ),
+                        by_tool,
+                    )
+                }
+                None => (Vec::new(), Vec::new(), Vec::new(), Default::default()),
             };
             this.update(cx, |this, cx| {
                 this.session_stats = stats;
                 this.usage_daily = daily;
                 this.usage_details = details;
+                this.usage_daily_by_tool = by_tool;
+                // 首次扫描时默认全选。
+                if this.usage_chart_tools.is_empty() {
+                    for k in ["claude", "codex", "gemini"] {
+                        this.usage_chart_tools.insert(k.to_string(), true);
+                    }
+                }
                 this.session_scanning = false;
                 cx.notify();
             })
@@ -1253,13 +2387,13 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("用量统计"),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("配额 / 余额 / 重置倒计时"),
                             ),
                     )
@@ -1288,9 +2422,9 @@ impl SwitchApp {
                     .gap(px(8.))
                     .p(px(14.))
                     .rounded(px(10.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.6))
+                    .bg(theme::panel_a(0.6))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.12))
+                    .border_color(theme::stroke_a(0.12))
                     .child(
                         div()
                             .flex()
@@ -1300,34 +2434,64 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(14.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(format!("{} · {}", tool.label(), provider_name)),
                             )
                             .child(
-                                widgets::ghost_button(("usage-query", i), "查询").on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.query_usage(tool, cx);
-                                    }),
-                                ),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        widgets::ghost_button(("usage-config", i), "配置脚本")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let pid = this
+                                                    .store
+                                                    .read()
+                                                    .expect("store lock")
+                                                    .config()
+                                                    .current
+                                                    .get(tool)
+                                                    .cloned();
+                                                if let Some(p) = pid {
+                                                    this.configure_usage(&p, cx);
+                                                }
+                                            })),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(("usage-query", i), "查询").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.query_usage(tool, cx);
+                                            }),
+                                        ),
+                                    ),
                             ),
                     )
                     .child(match (u, is_loading) {
                         (_, true) => div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child("查询中…"),
                         (Some(u), false) => {
                             let mut line = String::new();
-                            if let Some(remaining) = u.remaining {
-                                let unit = if u.unit.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" {}", u.unit)
-                                };
-                                let currency = u.currency.as_deref().unwrap_or("");
-                                line.push_str(&format!(
-                                    "剩余 {remaining}{unit}{currency}"
-                                ));
+                            let unit = if u.unit.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", u.unit)
+                            };
+                            let currency = u.currency.as_deref().unwrap_or("");
+                            if let Some(total) = u.total {
+                                line.push_str(&format!("总量 {total}{unit}{currency}"));
+                                if let Some(used) = u.used {
+                                    line.push_str(&format!(" · 已用 {used}{unit}{currency}"));
+                                }
+                                if let Some(remaining) = u.remaining {
+                                    line.push_str(&format!(
+                                        " · 剩余 {remaining}{unit}{currency}"
+                                    ));
+                                }
+                            } else if let Some(remaining) = u.remaining {
+                                line.push_str(&format!("剩余 {remaining}{unit}{currency}"));
                             } else {
                                 line.push_str("无用量数据");
                             }
@@ -1345,22 +2509,51 @@ impl SwitchApp {
                                     line.push_str(" · 已到重置点");
                                 }
                             }
-                            div()
+                            let mut col = div()
                                 .text_size(px(12.))
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(theme::text_dim())
                                 .child(line)
                                 .child(if u.source.is_empty() {
                                     div()
                                 } else {
                                     div()
                                         .text_size(px(11.))
-                                        .text_color(rgb(theme::TEXT_FAINT))
+                                        .text_color(theme::text_faint())
                                         .child(format!("来源: {}", u.source))
-                                })
+                                });
+                            // 配额进度条（总量+已用 → 显示剩余比例）。
+                            if let (Some(total), Some(used)) = (u.total, u.used) {
+                                if total > 0.0 {
+                                    let pct = (used / total).clamp(0.0, 1.0);
+                                    let color = if pct >= 0.9 {
+                                        theme::danger()
+                                    } else if pct >= 0.7 {
+                                        theme::cinnabar()
+                                    } else {
+                                        theme::jade()
+                                    };
+                                    col = col.child(
+                                        div()
+                                            .w(px(240.))
+                                            .mt(px(6.))
+                                            .h(px(6.))
+                                            .rounded_full()
+                                            .bg(theme::stroke_a(0.12))
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .w(px((240. * pct) as f32))
+                                                    .rounded_full()
+                                                    .bg(color),
+                                            ),
+                                    );
+                                }
+                            }
+                            col
                         }
                         (None, false) => div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("点击“查询”获取用量"),
                     })
             }))
@@ -1370,78 +2563,125 @@ impl SwitchApp {
                     .gap(px(8.))
                     .p(px(14.))
                     .rounded(px(10.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.6))
+                    .bg(theme::panel_a(0.6))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.12))
+                    .border_color(theme::stroke_a(0.12))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
-                                    .child("会话日志统计（Claude Code）"),
-                            )
-                            .child(
-                                widgets::ghost_button(("usage-session-refresh", 0usize), "扫描")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh_session_stats(cx);
-                                    })),
-                            ),
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("会话日志统计"),
                     )
                     .child(if self.session_scanning {
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child("扫描中…")
                     } else if self.session_stats.is_empty() {
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("点击“扫描”统计会话请求")
+                            .text_color(theme::text_dim())
+                            .child("无会话日志（Claude/Codex/Gemini）")
                     } else {
                         div()
                             .flex_col()
                             .gap(px(4.))
-                            .children(self.session_stats.iter().enumerate().map(|(i, s)| {
+                            .child(
                                 div()
-                                    .id(("usage-session-row", i))
                                     .flex()
-                                    .items_center()
                                     .gap(px(10.))
-                                    .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_size(px(10.5))
+                                    .text_color(theme::text_faint())
                                     .child(
                                         div()
-                                            .font_family(theme::MONO_FONT)
-                                            .text_color(rgb(theme::ACCENT))
+                                            .flex_1()
+                                            .child("模型"),
+                                    )
+                                    .child(div().w(px(64.)).child("请求"))
+                                    .child(div().w(px(80.)).child("输入"))
+                                    .child(div().w(px(80.)).child("输出"))
+                                    .child(div().w(px(72.)).child("花费")),
+                            )
+                            .children(self.session_stats.iter().take(12).map(|s| {
+                                div()
+                                    .flex()
+                                    .gap(px(10.))
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_dim())
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_color(theme::text())
                                             .child(s.model.clone()),
                                     )
-                                    .child(format!(
-                                        "{} 请求 · {} 输入 · {} 输出 · 缓存读 {}",
-                                        s.requests, s.input_tokens, s.output_tokens, s.cache_read_tokens
-                                    ))
                                     .child(
                                         div()
-                                            .font_family(theme::MONO_FONT)
-                                            .text_color(rgb(theme::JADE))
-                                            .child(match s.cost_usd {
-                                                Some(c) => format!("≈ ${:.4}", c),
-                                                None => "价格未知".to_string(),
-                                            })
+                                            .w(px(64.))
+                                            .child(s.requests.to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(80.))
+                                            .child(format_tokens(s.input_tokens)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(80.))
+                                            .child(format_tokens(s.output_tokens)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .child(
+                                                s.cost_usd
+                                                    .map(|c| format!("${:.4}", c))
+                                                    .unwrap_or_else(|| "—".into()),
+                                            ),
                                     )
                             }))
                     })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("stats-refresh", "刷新统计").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.refresh_session_stats(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
             )
             .child(self.render_usage_charts(cx))
-    }
+        }
 
-    /// 渲染 M9 趋势图 + 热力图 + 请求明细。
-    fn render_usage_charts(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let daily = self.usage_daily.clone();
+    /// 渲染 M9 趋势图 + 热力图 + 请求明细（按工具筛选）。
+    fn render_usage_charts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let by_tool = self.usage_daily_by_tool.clone();
+        let tools = self.usage_chart_tools.clone();
+        // 按筛选聚合每日数据；未初始化时全选。
+        let mut merged: std::collections::BTreeMap<String, ns_usage::DailyCount> =
+            std::collections::BTreeMap::new();
+        for (tool_key, vec) in &by_tool {
+            let selected = tools.get(tool_key).copied().unwrap_or(true);
+            if !selected {
+                continue;
+            }
+            for d in vec {
+                let e = merged.entry(d.date.clone()).or_insert_with(|| {
+                    ns_usage::DailyCount {
+                        date: d.date.clone(),
+                        ..Default::default()
+                    }
+                });
+                e.requests += d.requests;
+                e.input_tokens += d.input_tokens;
+                e.output_tokens += d.output_tokens;
+            }
+        }
+        let daily: Vec<ns_usage::DailyCount> = merged.into_values().collect();
         let details = self.usage_details.clone();
         let max_requests = daily
             .iter()
@@ -1453,6 +2693,76 @@ impl SwitchApp {
             .flex_col()
             .gap(px(10.))
             .child(
+                // 按工具筛选（对齐 cc-switch 用量面板 app filter）。
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(widgets::section_label("图表包含"))
+                    .children(
+                        [
+                            ("claude", "Claude"),
+                            ("codex", "Codex"),
+                            ("gemini", "Gemini"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (key, label))| {
+                            let selected = tools.get(key).copied().unwrap_or(true);
+                            widgets::ghost_button(
+                                gpui::ElementId::from(("usage-filter", i)),
+                                label,
+                            )
+                            .when(selected, |b| {
+                                b.bg(theme::accent_a(0.18))
+                                    .border_1()
+                                    .border_color(theme::accent_a(0.5))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let k = key.to_string();
+                                let cur = this
+                                    .usage_chart_tools
+                                    .get(&k)
+                                    .copied()
+                                    .unwrap_or(true);
+                                this.usage_chart_tools.insert(k, !cur);
+                                cx.notify();
+                            }))
+                        }),
+                    ),
+            )
+            .child(
+                // 日期范围预设（对齐 cc-switch UsageDateRangePicker）。
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(widgets::section_label("日期范围"))
+                    .children(
+                        [(7usize, "7 天"), (14, "14 天"), (30, "30 天"), (0, "全部")]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, (days, label))| {
+                                let selected = self.usage_range_days == days;
+                                widgets::ghost_button(
+                                    gpui::ElementId::from(("usage-range", i)),
+                                    label,
+                                )
+                                .when(selected, |b| {
+                                    b.bg(theme::accent_a(0.18))
+                                        .border_1()
+                                        .border_color(theme::accent_a(0.5))
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.usage_range_days != days {
+                                        this.usage_range_days = days;
+                                        this.refresh_session_stats(cx);
+                                    }
+                                }))
+                            }),
+                    ),
+            )
+            .child(
                 div()
                     .flex_col()
                     .gap(px(6.))
@@ -1460,13 +2770,17 @@ impl SwitchApp {
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child("近 30 日请求趋势"),
+                            .text_color(theme::text())
+                            .child(if self.usage_range_days == 0 {
+                                "全部请求趋势".to_string()
+                            } else {
+                                format!("近 {} 日请求趋势", self.usage_range_days)
+                            }),
                     )
                     .child(if daily.is_empty() {
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("扫描后显示趋势")
                     } else {
                         div()
@@ -1482,11 +2796,11 @@ impl SwitchApp {
                                     .flex_1()
                                     .h(px(h))
                                     .rounded(px(2.))
-                                    .bg(theme::alpha(theme::ACCENT, 0.55))
+                                    .bg(theme::accent_a(0.55))
                                     .child(
                                         div()
                                             .text_size(px(9.))
-                                            .text_color(rgb(theme::TEXT_FAINT))
+                                            .text_color(theme::text_faint())
                                             .child(d.date.clone()),
                                     )
                             }))
@@ -1500,13 +2814,17 @@ impl SwitchApp {
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child("近 30 日热力图"),
+                            .text_color(theme::text())
+                            .child(if self.usage_range_days == 0 {
+                                "全部热力图".to_string()
+                            } else {
+                                format!("近 {} 日热力图", self.usage_range_days)
+                            }),
                     )
                     .child(if daily.is_empty() {
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("扫描后显示热力图")
                     } else {
                         let max = daily.iter().map(|d| d.requests).max().unwrap_or(1).max(1);
@@ -1525,9 +2843,9 @@ impl SwitchApp {
                                     .w(px(16.))
                                     .h(px(16.))
                                     .rounded(px(3.))
-                                    .bg(theme::alpha(theme::ACCENT, alpha))
+                                    .bg(theme::accent_a(alpha))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                                    .border_color(theme::stroke_a(0.08))
                             }))
                     }),
             )
@@ -1539,13 +2857,13 @@ impl SwitchApp {
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("请求明细"),
                     )
                     .child(if details.is_empty() {
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("扫描后显示明细")
                     } else {
                         div()
@@ -1557,11 +2875,22 @@ impl SwitchApp {
                                     .items_center()
                                     .gap(px(10.))
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
+                                    .child(
+                                        div()
+                                            .w(px(56.))
+                                            .text_color(theme::text_faint())
+                                            .child(match d.tool.as_str() {
+                                                "claude" => "Claude",
+                                                "codex" => "Codex",
+                                                "gemini" => "Gemini",
+                                                _ => "-",
+                                            }),
+                                    )
                                     .child(
                                         div()
                                             .font_family(theme::MONO_FONT)
-                                            .text_color(rgb(theme::ACCENT))
+                                            .text_color(theme::accent())
                                             .child(d.model.clone()),
                                     )
                                     .child(format!(
@@ -1574,15 +2903,16 @@ impl SwitchApp {
     }
 
 
-    /// 加载 Claude Code 会话列表（异步扫描）。
+    /// 加载会话列表（异步扫描，按当前 session_tool）。
     fn load_sessions(&mut self, cx: &mut Context<Self>) {
         self.sessions_loading = true;
         cx.notify();
+        let tool = self.session_tool;
         cx.spawn(async move |this, cx| {
             let sessions = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .as_deref()
-                .map(|h| ns_sessions::list_claude_sessions(h))
+                .map(|h| ns_sessions::list_sessions(h, tool))
                 .unwrap_or_default();
             this.update(cx, |this, cx| {
                 this.sessions = sessions;
@@ -1596,21 +2926,65 @@ impl SwitchApp {
 
     /// 打开会话阅读视图（异步解析）。
     fn open_session_view(&mut self, path: String, cx: &mut Context<Self>) {
+        let session_tool = self.session_tool;
         cx.spawn(async move |this, cx| {
+            let inferred_tool = if path.contains("/.codex/") {
+                "codex"
+            } else if path.contains("/.gemini/") {
+                "gemini"
+            } else if path.starts_with("opencode:") {
+                "opencode"
+            } else if path.contains("/.pi/") {
+                "pi"
+            } else if path.contains("/.hermes/") {
+                "hermes"
+            } else if path.starts_with("openclaw:") {
+                "openclaw"
+            } else {
+                "claude"
+            };
+            // OpenCode 会话 path 形如 `opencode:<session_id>`。
+            let session_id = path
+                .strip_prefix("opencode:")
+                .or_else(|| path.strip_prefix("openclaw:"))
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("session")
+                        .to_string()
+                });
             let meta = ns_sessions::SessionMeta {
-                id: std::path::Path::new(&path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("session")
-                    .to_string(),
+                id: session_id.clone(),
                 project: String::new(),
                 path: path.clone(),
                 mtime: 0,
                 message_count: 0,
                 last_model: None,
                 title: String::new(),
+                tool: inferred_tool.into(),
             };
-            let msgs = ns_sessions::parse_session(std::path::Path::new(&path));
+            let msgs = if session_tool == ns_sessions::SessionTool::OpenCode {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                home.as_deref()
+                    .map(|h| ns_sessions::parse_opencode_session(h, &session_id))
+                    .unwrap_or_default()
+            } else if inferred_tool == "pi" {
+                ns_sessions::parse_pi_session(std::path::Path::new(&path))
+            } else if inferred_tool == "hermes" {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                home.as_deref()
+                    .map(|h| ns_sessions::parse_hermes_session(h, &session_id))
+                    .unwrap_or_default()
+            } else if inferred_tool == "openclaw" {
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                home.as_deref()
+                    .map(|h| ns_sessions::parse_openclaw_session(h, &session_id))
+                    .unwrap_or_default()
+            } else {
+                ns_sessions::parse_session(std::path::Path::new(&path))
+            };
             let rounds = ns_sessions::build_rounds(&msgs);
             let count = rounds.len();
             this.update(cx, |this, cx| {
@@ -1624,6 +2998,7 @@ impl SwitchApp {
         })
         .detach();
     }
+
 
     /// 渲染会话阅读视图：分节展示、每轮摘要折叠、大纲、导出、恢复命令。
     fn render_session_view(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1672,13 +3047,13 @@ impl SwitchApp {
                                         div()
                                             .text_size(px(16.))
                                             .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(format!("会话 {}", session_id)),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(12.))
-                                            .text_color(rgb(theme::TEXT_FAINT))
+                                            .text_color(theme::text_faint())
                                             .child(format!("{} 轮", rounds.len())),
                                     ),
                             )
@@ -1709,7 +3084,12 @@ impl SwitchApp {
                                     .child(
                                         widgets::ghost_button(("sess-recover", 0usize), "恢复命令").on_click(
                                             cx.listener(move |this, _, _, cx| {
-                                                let cmd = ns_sessions::recover_command(&session_id);
+                                                let tool = this
+                                                    .session_meta
+                                                    .as_ref()
+                                                    .map(|m| m.tool.as_str())
+                                                    .unwrap_or("claude");
+                                                let cmd = ns_sessions::recover_command_for(tool, &session_id);
                                                 this.status = cmd.clone();
                                                 cx.notify();
                                             }),
@@ -1742,9 +3122,9 @@ impl SwitchApp {
                                     .gap(px(4.))
                                     .p(px(10.))
                                     .rounded(px(8.))
-                                    .bg(theme::alpha(theme::PANEL_SOLID, 0.4))
+                                    .bg(theme::panel_a(0.4))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                                    .border_color(theme::stroke_a(0.08))
                                     .child(
                                         div()
                                             .flex()
@@ -1781,7 +3161,7 @@ impl SwitchApp {
                                             .child(
                                                 div()
                                                     .text_size(px(12.))
-                                                    .text_color(rgb(theme::TEXT))
+                                                    .text_color(theme::text())
                                                     .child(format!("用户：{}", r.user_text)),
                                             )
                                             .children(r.assistant.iter().enumerate().map(|(_, m)| {
@@ -1791,7 +3171,7 @@ impl SwitchApp {
                                                     .child(
                                                         div()
                                                             .text_size(px(11.))
-                                                            .text_color(rgb(theme::ACCENT))
+                                                            .text_color(theme::accent())
                                                             .child(if m.is_tool_use {
                                                                 format!(
                                                                     "工具 {}",
@@ -1805,7 +3185,7 @@ impl SwitchApp {
                                                         div()
                                                             .font_family(theme::MONO_FONT)
                                                             .text_size(px(11.))
-                                                            .text_color(rgb(theme::TEXT_DIM))
+                                                            .text_color(theme::text_dim())
                                                             .child(m.text.clone()),
                                                     )
                                             }))
@@ -1825,7 +3205,7 @@ impl SwitchApp {
                     .gap(px(8.))
                     .p(px(12.))
                     .border_l_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.1))
+                    .border_color(theme::stroke_a(0.1))
                     .child(div().w_full().child(self.session_filter.clone()))
                     .child(
                         div()
@@ -1838,7 +3218,7 @@ impl SwitchApp {
                                     .p(px(6.))
                                     .rounded(px(4.))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(theme::alpha(theme::STROKE, 0.06)))
+                                    .hover(|s| s.bg(theme::stroke_a(0.06)))
                                     .text_size(px(11.))
                                     .text_color(rgb(if is_open {
                                         theme::TEXT
@@ -1857,8 +3237,15 @@ impl SwitchApp {
             )
     }
 
-    /// 应用深链动作（启动时）。
-    fn apply_deeplink(&self, action: &crate::deeplink::DeepLinkAction) {
+    /// 接收深链动作：暂存待确认（含脱敏摘要），由 UI 确认浮层决定执行。
+    fn apply_deeplink(&mut self, action: &crate::deeplink::DeepLinkAction, cx: &mut Context<Self>) {
+        self.deeplink_pending = Some((action.clone(), Self::deeplink_summary(action)));
+        cx.notify();
+    }
+
+    /// 确认后执行深链动作（原直接导入逻辑）。
+    fn execute_deeplink(&mut self, action: &crate::deeplink::DeepLinkAction, cx: &mut Context<Self>) {
+        self.deeplink_pending = None;
         match action {
             crate::deeplink::DeepLinkAction::ImportProvider {
                 preset_id,
@@ -1875,6 +3262,10 @@ impl SwitchApp {
                         key: key.clone(),
                         model: model.clone(),
                         usage_script: String::new(),
+                        api_format: preset.api_format.to_string(),
+                        icon: preset.icon.to_string(),
+                        icon_color: preset.icon_color.to_string(),
+                        usage_enabled: true,
                     };
                     let provider = crate::dialog::build_provider(preset, &fields);
                     let id = provider.id.clone();
@@ -1883,15 +3274,16 @@ impl SwitchApp {
                         let _ = s.add_provider(provider);
                         let _ = s.set_current(ns_presets::Tool::Claude, id);
                     }
+                    // P6-5：导入后定位到 Claude 供应商页。
+                    self.active_tool = ns_presets::Tool::Claude;
+                    self.page = Page::Providers;
+                    cx.notify();
                 }
             }
             crate::deeplink::DeepLinkAction::SwitchProvider { tool, provider_id } => {
                 if let Some(t) = ns_presets::Tool::ALL.iter().find(|t| t.id_str() == tool) {
-                    let _ = self
-                        .store
-                        .write()
-                        .expect("store lock")
-                        .set_current(*t, provider_id.clone());
+                    // 真实切换：写 live 配置 + 更新 current。
+                    self.switch_to_provider_for(*t, provider_id, cx);
                 }
             }
             crate::deeplink::DeepLinkAction::ImportRepo { kind, url } => {
@@ -1924,7 +3316,89 @@ impl SwitchApp {
                 }
                 let _ = std::fs::remove_dir_all(&tmp);
             }
-            _ => {}
+            crate::deeplink::DeepLinkAction::ImportMcp { name, command } => {
+                if name.trim().is_empty() || command.trim().is_empty() {
+                    eprintln!("[deeplink] MCP 导入参数不完整");
+                    return;
+                }
+                let server = ns_mcp::model::McpServer {
+                    name: name.clone(),
+                    transport: ns_mcp::model::McpTransport::Stdio,
+                    command: Some(command.clone()),
+                    args: Vec::new(),
+                    ..Default::default()
+                };
+                let paths = ns_mcp::tools::McpPaths::from_env();
+                match ns_mcp::manager::write_tool(
+                    ns_presets::Tool::Claude,
+                    &paths,
+                    &[],
+                    &[server],
+                ) {
+                    Ok(_) => {
+                        eprintln!("[deeplink] 已导入 MCP {name}");
+                        self.page = Page::Mcp;
+                        cx.notify();
+                    }
+                    Err(e) => eprintln!("[deeplink] MCP 导入失败: {e}"),
+                }
+            }
+            crate::deeplink::DeepLinkAction::ImportSkill { name, source } => {
+                if name.trim().is_empty() {
+                    eprintln!("[deeplink] Skill 导入参数不完整");
+                    return;
+                }
+                let skill = ns_skills::model::Skill {
+                    name: name.clone(),
+                    description: String::new(),
+                    body: if source.trim().is_empty() {
+                        format!("# {name}\n")
+                    } else {
+                        source.clone()
+                    },
+                    ..Default::default()
+                };
+                let paths = ns_skills::model::SkillPaths::from_env();
+                match ns_skills::tools::write_tool(
+                    ns_presets::Tool::Claude,
+                    &paths,
+                    &skill,
+                ) {
+                    Ok(_) => {
+                        eprintln!("[deeplink] 已导入 Skill {name}");
+                        self.page = Page::Skills;
+                        cx.notify();
+                    }
+                    Err(e) => eprintln!("[deeplink] Skill 导入失败: {e}"),
+                }
+            }
+            crate::deeplink::DeepLinkAction::ImportPrompt { name, content } => {
+                if name.trim().is_empty() {
+                    eprintln!("[deeplink] Prompt 导入参数不完整");
+                    return;
+                }
+                let mut store = match ns_prompts::store::PromptStore::open() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[deeplink] Prompt 库打开失败: {e}");
+                        return;
+                    }
+                };
+                let entry = ns_prompts::model::PromptEntry {
+                    name: name.clone(),
+                    body: content.clone(),
+                    enabled: true,
+                    updated_at: now_ts() as u64 * 1000,
+                };
+                match store.save_entry(ns_presets::Tool::Claude, entry) {
+                    Ok(_) => {
+                        eprintln!("[deeplink] 已导入 Prompt {name}");
+                        self.page = Page::Prompts;
+                        cx.notify();
+                    }
+                    Err(e) => eprintln!("[deeplink] Prompt 导入失败: {e}"),
+                }
+            }
         }
     }
 
@@ -1944,12 +3418,489 @@ impl SwitchApp {
         Ok(())
     }
 
+/// 构建深链动作的脱敏摘要（用于确认对话框展示，key/content 脱敏）。
+fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
+    fn mask(s: &str) -> String {
+        if s.len() <= 8 {
+            "****".to_string()
+        } else {
+            let mut out = s[..4].to_string();
+            out.push_str("…");
+            out.push_str(&s[s.len() - 4..]);
+            out
+        }
+    }
+    match action {
+        crate::deeplink::DeepLinkAction::ImportProvider {
+            preset_id,
+            endpoint,
+            key,
+            model,
+        } => format!(
+            "导入供应商：{}（端点 {}，模型 {}，密钥 {}）",
+            preset_id,
+            endpoint,
+            model,
+            mask(key)
+        ),
+        crate::deeplink::DeepLinkAction::SwitchProvider { tool, provider_id } => {
+            format!("切换 {tool} 到供应商 {provider_id}")
+        }
+        crate::deeplink::DeepLinkAction::ImportRepo { kind, url } => {
+            format!("导入 {kind} 仓库：{url}")
+        }
+        crate::deeplink::DeepLinkAction::ImportMcp { name, command } => {
+            format!("导入 MCP 服务器：{name}（命令 {}）", mask(command))
+        }
+        crate::deeplink::DeepLinkAction::ImportSkill { name, source } => {
+            format!("导入 Skill：{name}（正文 {} 字）", source.chars().count())
+        }
+        crate::deeplink::DeepLinkAction::ImportPrompt { name, content } => {
+            format!("导入 Prompt：{name}（内容 {} 字）", content.chars().count())
+        }
+    }
+}
+
     /// 切到第 idx 页（快捷键 cmd-1..6）。
     fn goto_page(&mut self, idx: usize, cx: &mut Context<Self>) {
         if let Some(p) = Page::ALL.get(idx) {
             self.page = *p;
             cx.notify();
         }
+    }
+
+    /// 检测添加/编辑对话框是否有未保存修改（字段与初始快照比对）。
+    pub(crate) fn dialog_is_dirty(&self, cx: &mut Context<Self>) -> bool {
+        let f = &self.dialog_fields;
+        let endpoint = self.dialog_inputs.endpoint.read(cx).text();
+        let key = self.dialog_inputs.key.read(cx).text();
+        let model = self.dialog_inputs.model.read(cx).text();
+        let usage = self.dialog_inputs.usage_script.read(cx).text();
+        let icon = self.dialog_inputs.icon.read(cx).text();
+        let icon_color = self.dialog_inputs.icon_color.read(cx).text();
+        endpoint != f.endpoint
+            || key != f.key
+            || model != f.model
+            || usage != f.usage_script
+            || icon != f.icon
+            || icon_color != f.icon_color
+    }
+
+    /// Esc：关闭当前打开的对话框/菜单。
+    fn escape_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.pending_switch.is_some() {
+            self.pending_switch = None;
+            self.status = "已取消切换".into();
+            self.status_tone = StatusTone::Neutral;
+        } else if self.deeplink_pending.is_some() {
+        } else if self.confirm_delete.is_some() {
+        } else if self.edit_id.is_some() || self.add_open {
+            if self.dialog_is_dirty(cx) {
+                // 有未保存修改：显示守卫确认浮层，不直接关闭。
+                self.dialog_dirty = true;
+                cx.notify();
+                return;
+            }
+            self.add_open = false;
+            self.edit_id = None;
+        } else if self.open_menu.is_some() {
+            self.open_menu = None;
+        } else if self.mcp.dialog_open {
+            self.mcp.dialog_open = false;
+        } else if self.mcp.scope_open {
+            self.mcp.scope_open = false;
+        } else if self.skills.dialog_open {
+            self.skills.request_close(cx);
+        } else if self.skills.install_open {
+            self.skills.install_open = false;
+        } else if self.prompts.dialog_open {
+            self.prompts.request_close(cx);
+        }
+        cx.notify();
+    }
+
+    /// Cmd-S：当前页/对话框的保存动作。
+    ///
+    /// 供应商对话框 → `dialog::save_provider`；Prompts/Skills/MCP 对话框 →
+    /// 各自 `save`；工具配置编辑器 → `save_toolconfig`。无打开对话框时提示。
+    fn save_current(&mut self, cx: &mut Context<Self>) {
+        // 供应商添加/编辑对话框（有预设时走标准保存路径）。
+        if self.add_open || self.edit_id.is_some() {
+            let preset = self
+                .dialog_preset
+                .as_deref()
+                .and_then(|id| {
+                    ns_presets::search_presets("", None)
+                        .into_iter()
+                        .find(|p| p.id == id)
+                });
+            if let Some(preset) = preset {
+                crate::dialog::save_provider(self, preset, &self.dialog_fields.clone(), cx);
+            } else {
+                self.status = "请先选择预设".into();
+                self.status_tone = StatusTone::Error;
+                cx.notify();
+            }
+            return;
+        }
+        if self.prompts.dialog_open {
+            self.prompts.save(cx);
+            return;
+        }
+        if self.skills.dialog_open || self.skills.install_open {
+            if self.skills.dialog_open {
+                self.skills.save(cx);
+            }
+            return;
+        }
+        if self.mcp.dialog_open {
+            self.mcp.save(cx);
+            return;
+        }
+        if self.toolconfig_id.is_some() {
+            self.save_toolconfig(cx);
+            return;
+        }
+        self.status = "当前无可保存的表单".into();
+        self.status_tone = StatusTone::Neutral;
+        cx.notify();
+    }
+
+    /// 关闭首次运行欢迎页并持久化。
+    fn dismiss_welcome(&mut self, cx: &mut Context<Self>) {
+        self.welcome_visible = false;
+        if let Ok(mut s) = self.store.write() {
+            let _ = s.set_welcome_dismissed(true);
+        }
+        cx.notify();
+    }
+
+    /// 首次运行欢迎页（全屏遮罩 + 引导卡片）。
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pal = ns_ui::theme::active_palette();
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x080604, 0.78))
+            .child(
+                div()
+                    .w(px(520.))
+                    .flex_col()
+                    .gap(px(16.))
+                    .p(px(28.))
+                    .rounded(px(20.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(widgets::brand_mark(44.))
+                            .child(
+                                div()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(18.))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(theme::text())
+                                            .child("欢迎使用 ns-switch"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(theme::text_faint())
+                                            .child("一键切换 AI 编程助手 API 供应商"),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(
+                                welcome_row(
+                                    "①",
+                                    "添加供应商",
+                                    "从 90+ 预设中选择，或自定义端点/密钥/模型",
+                                    pal,
+                                ),
+                            )
+                            .child(welcome_row(
+                                "②",
+                                "一键切换",
+                                "只改写客户端配置关键字段，其余原样保留",
+                                pal,
+                            ))
+                            .child(welcome_row(
+                                "③",
+                                "管理 MCP / Skills / Prompts",
+                                "统一面板，跨工具同步",
+                                pal,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::primary_button("welcome-start", "开始使用").on_click(
+                                    cx.listener(|this, _, _, cx| this.dismiss_welcome(cx)),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    /// 更新说明（WhatsNew）浮层：上次版本 ≠ 当前版本时显示（对齐 cc-switch WhatsNewDialog）。
+    fn render_whats_new(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pal = ns_ui::theme::active_palette();
+        let last_seen = self
+            .store
+            .read()
+            .map(|s| s.config().settings.last_seen_version.clone())
+            .unwrap_or_default();
+        let version = crate::update::CURRENT_VERSION;
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x080604, 0.72))
+            .child(
+                div()
+                    .w(px(560.))
+                    .flex_col()
+                    .gap(px(16.))
+                    .p(px(28.))
+                    .rounded(px(20.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .child(widgets::brand_mark(44.))
+                            .child(
+                                div()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(18.))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(theme::text())
+                                            .child(format!("更新到 {version}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(theme::text_faint())
+                                            .child(if last_seen.is_empty() {
+                                                "欢迎使用 ns-switch".to_string()
+                                            } else {
+                                                format!("上次版本 {last_seen}")
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(welcome_row(
+                                "✦",
+                                "界面布局对齐 cc-switch",
+                                "侧栏应用列表滚动区 + 全局页面贴底 + 底栏应用/设置",
+                                pal,
+                            ))
+                            .child(welcome_row(
+                                "✦",
+                                "供应商卡片增强",
+                                "左拖拽手柄 + 右侧额度列 + 健康芯片 + 模式色边框",
+                                pal,
+                            ))
+                            .child(welcome_row(
+                                "✦",
+                                "切换引擎稳定",
+                                "保序补丁改写、首写备份、冲突检测",
+                                pal,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::primary_button("whatsnew-close", "开始使用").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.whats_new_visible = false;
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    /// 写入前冲突确认浮层（切换目标被占用/修改；确认强制执行 / 取消）。
+    fn render_pending_switch_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tool, provider, note) = self
+            .pending_switch
+            .clone()
+            .expect("pending_switch 非空");
+        div()
+            .id("switch-confirm-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("switch-confirm")
+                    .w(px(480.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("切换前冲突确认"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "将切换到「{}」（{}）。\n{}",
+                                provider.name,
+                                tool.label(),
+                                note
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::cinnabar())
+                            .child("⚠ 目标配置文件已被手动修改/占用，继续切换将覆盖这些更改。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button(("switch-cancel", 0usize), "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.pending_switch = None;
+                                        this.status = "已取消切换".into();
+                                        this.status_tone = StatusTone::Neutral;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button(("switch-confirm", 0usize), "强制切换")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some((tool, provider, _)) = this.pending_switch.clone()
+                                        {
+                                            this.pending_switch = None;
+                                            this.apply_switch(tool, &provider, cx);
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// 深链导入确认浮层（脱敏摘要 + 确认/取消；风险提示）。
+    fn render_deeplink_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (_, summary) = self
+            .deeplink_pending
+            .clone()
+            .expect("deeplink_pending 非空");
+        div()
+            .id("deeplink-confirm-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("deeplink-confirm")
+                    .w(px(460.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("深链导入确认"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::cinnabar())
+                            .child("⚠ 导入会写入本机配置文件，请确认来源可信。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button(("deeplink-cancel", 0usize), "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.deeplink_pending = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button(("deeplink-confirm", 0usize), "确认导入")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some((action, _)) = this.deeplink_pending.clone() {
+                                            this.execute_deeplink(&action, cx);
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
     }
 
 
@@ -1965,6 +3916,42 @@ impl SwitchApp {
                 this.tools_result = result;
                 this.tools_scanning = false;
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 安装/升级 CLI 工具（异步执行 npm 命令）。
+    fn install_cli(&mut self, tool: ns_tools::Tool, cx: &mut Context<Self>) {
+        self.tool_msg = format!("正在安装 {} …", tool.name());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = ns_tools::install_tool(tool);
+            this.update(cx, |this, cx| {
+                this.tool_msg = match result {
+                    Ok(msg) => format!("已安装 {}：{}", tool.name(), msg.trim()),
+                    Err(e) => format!("安装 {} 失败：{e}", tool.name()),
+                };
+                this.scan_tools(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 卸载 CLI 工具（异步执行 npm 命令）。
+    fn uninstall_cli(&mut self, tool: ns_tools::Tool, cx: &mut Context<Self>) {
+        self.tool_msg = format!("正在卸载 {} …", tool.name());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = ns_tools::uninstall_tool(tool);
+            this.update(cx, |this, cx| {
+                this.tool_msg = match result {
+                    Ok(msg) => format!("已卸载 {}：{}", tool.name(), msg.trim()),
+                    Err(e) => format!("卸载 {} 失败：{e}", tool.name()),
+                };
+                this.scan_tools(cx);
             })
             .ok();
         })
@@ -1995,28 +3982,57 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("工具管理"),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("CLI 工具版本探测与安装"),
                             ),
                     )
-                    .child(
+                    .children([
                         widgets::ghost_button(("tools-scan", 0usize), "扫描").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.scan_tools(cx);
                             }),
                         ),
-                    ),
+                        widgets::ghost_button(("tools-upgrade-all", 0usize), "全部升级").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let installed: Vec<ns_tools::Tool> = this
+                                    .tools_result
+                                    .iter()
+                                    .filter(|(_, i)| i.is_some())
+                                    .map(|(t, _)| *t)
+                                    .collect();
+                                if installed.is_empty() {
+                                    this.tool_msg = "没有已安装的工具可升级".into();
+                                    cx.notify();
+                                    return;
+                                }
+                                this.tool_msg =
+                                    format!("正在升级 {} 个工具…", installed.len());
+                                cx.notify();
+                                for t in installed {
+                                    this.install_cli(t, cx);
+                                }
+                            }),
+                        ),
+                    ])
             )
+            .child(if !self.tool_msg.is_empty() {
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::jade())
+                    .child(self.tool_msg.clone())
+            } else {
+                div()
+            })
             .child(if scanning {
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(theme::TEXT_DIM))
+                    .text_color(theme::text_dim())
                     .child("扫描中…")
             } else {
                 div()
@@ -2038,9 +4054,9 @@ impl SwitchApp {
                             .gap(px(10.))
                             .p(px(10.))
                             .rounded(px(8.))
-                            .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                            .bg(theme::panel_a(0.5))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.1))
+                            .border_color(theme::stroke_a(0.1))
                             .child(
                                 div()
                                     .flex_1()
@@ -2049,7 +4065,7 @@ impl SwitchApp {
                                     .child(
                                         div()
                                             .text_size(px(13.))
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(format!("{name} ({bin})")),
                                     )
                                     .child(
@@ -2080,12 +4096,232 @@ impl SwitchApp {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
-                                    .child(tool.install_command()),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        widgets::ghost_button(
+                                            ("tool-install", *tool as usize),
+                                            if inst.is_some() { "升级" } else { "安装" },
+                                        )
+                                        .on_click({
+                                            let t = *tool;
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.install_cli(t, cx);
+                                            })
+                                        }),
+                                    )
+                                    .when(inst.is_some(), |el| {
+                                        el.child(
+                                            widgets::danger_button(
+                                                ("tool-uninstall", *tool as usize),
+                                                "卸载",
+                                            )
+                                            .on_click({
+                                                let t = *tool;
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.uninstall_cli(t, cx);
+                                                })
+                                            }),
+                                        )
+                                    }),
                             )
                     }))
             })
+    }
+
+    /// 收集当前 MCP/Skills/Prompts 状态为项目快照 extras（JSON 载体）。
+    ///
+    /// key：`mcp` / `skills` / `prompts`，值为 `{tool_id: [...]}`。
+    fn project_extras(
+        &self,
+        _cx: &mut Context<Self>,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        use std::collections::BTreeMap;
+        let mut extras: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+        // MCP：遍历支持 MCP 的工具，读服务器列表。
+        let mcp_tools = [
+            ns_presets::Tool::Claude,
+            ns_presets::Tool::Codex,
+            ns_presets::Tool::Gemini,
+            ns_presets::Tool::Opencode,
+            ns_presets::Tool::GrokBuild,
+        ];
+        let mcp_paths = ns_mcp::tools::McpPaths::from_env();
+        let mut mcp_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for t in mcp_tools {
+            if let Ok(servers) = ns_mcp::manager::read_tool(t, &mcp_paths) {
+                if !servers.is_empty() {
+                    mcp_map.insert(
+                        t.id_str().to_string(),
+                        serde_json::to_value(&servers).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+        }
+        if !mcp_map.is_empty() {
+            extras.insert("mcp".into(), serde_json::to_value(&mcp_map).unwrap_or_default());
+        }
+
+        // Skills：遍历全部工具读技能（含共享目录设置）。
+        let skill_paths = ns_skills::model::SkillPaths::from_env();
+        let mut skills_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        for t in ns_presets::Tool::ALL {
+            if let Ok(skills) = ns_skills::manager::read_tool(t, &skill_paths) {
+                if !skills.is_empty() {
+                    skills_map.insert(
+                        t.id_str().to_string(),
+                        serde_json::to_value(&skills).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+        }
+        if !skills_map.is_empty() {
+            extras.insert("skills".into(), serde_json::to_value(&skills_map).unwrap_or_default());
+        }
+
+        // Prompts：读各工具提示库条目。
+        let prompt_paths = ns_prompts::model::PromptPaths::from_env();
+        let mut prompts_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        if let Ok(store) = ns_prompts::store::PromptStore::open_at(prompt_paths.home.clone()) {
+            for t in ns_presets::Tool::ALL {
+                let entries = store.entries_for(t);
+                if !entries.is_empty() {
+                    prompts_map.insert(
+                        t.id_str().to_string(),
+                        serde_json::to_value(&entries).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+        }
+        if !prompts_map.is_empty() {
+            extras.insert("prompts".into(), serde_json::to_value(&prompts_map).unwrap_or_default());
+        }
+
+        // 工作区快照：OpenClaw openclaw.json + Hermes config.yaml（全文备份/恢复）。
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            let files: [( &str, std::path::PathBuf); 2] = [
+                ("openclaw", home.join(".openclaw").join("openclaw.json")),
+                ("hermes", home.join(".hermes").join("config.yaml")),
+            ];
+            let mut ws: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (key, path) in files {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    ws.insert(key.to_string(), serde_json::Value::String(text));
+                }
+            }
+            if !ws.is_empty() {
+                extras.insert("workspace".into(), serde_json::to_value(&ws).unwrap_or_default());
+            }
+        }
+        extras
+    }
+
+    /// 恢复项目快照 extras 到 MCP/Skills/Prompts（覆盖对应工具当前配置）。
+    fn apply_project_extras(
+        &mut self,
+        extras: &std::collections::BTreeMap<String, serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) {
+
+
+        // MCP 恢复。
+        if let Some(v) = extras.get("mcp").and_then(|v| v.as_object()) {
+            let paths = ns_mcp::tools::McpPaths::from_env();
+            for (tid, servers_v) in v {
+                let Some(tool) = ns_presets::Tool::ALL.iter().find(|t| t.id_str() == tid) else {
+                    continue;
+                };
+                let Some(servers) = serde_json::from_value::<Vec<ns_mcp::model::McpServer>>(
+                    servers_v.clone(),
+                )
+                .ok()
+                else {
+                    continue;
+                };
+                let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+                // 先移除当前全部（按已读列表），再写回快照列表。
+                if let Ok(current) = ns_mcp::manager::read_tool(*tool, &paths) {
+                    let cur: Vec<String> = current.iter().map(|s| s.name.clone()).collect();
+                    let _ = ns_mcp::manager::write_tool(*tool, &paths, &cur, &[]);
+                }
+                let _ = ns_mcp::manager::write_tool(*tool, &paths, &names, &servers);
+            }
+        }
+
+        // Skills 恢复（写回各工具技能目录）。
+        if let Some(v) = extras.get("skills").and_then(|v| v.as_object()) {
+            let paths = ns_skills::model::SkillPaths::from_env();
+            for (tid, skills_v) in v {
+                let Some(tool) = ns_presets::Tool::ALL.iter().find(|t| t.id_str() == tid) else {
+                    continue;
+                };
+                let Some(skills) = serde_json::from_value::<Vec<ns_skills::model::Skill>>(
+                    skills_v.clone(),
+                )
+                .ok()
+                else {
+                    continue;
+                };
+                // 逐技能写回（复用 manager 单技能写入）。
+                for sk in skills {
+                    let _ = ns_skills::manager::write_tool(
+                        *tool,
+                        &paths,
+                        &sk,
+                        ns_skills::model::SyncStrategy::Auto,
+                    );
+                }
+            }
+        }
+
+        // Prompts 恢复（写回提示库）。
+        if let Some(v) = extras.get("prompts").and_then(|v| v.as_object()) {
+            let prompt_paths = ns_prompts::model::PromptPaths::from_env();
+            if let Ok(mut store) =
+                ns_prompts::store::PromptStore::open_at(prompt_paths.home.clone())
+            {
+                for (tid, entries_v) in v {
+                    let Some(tool) = ns_presets::Tool::ALL.iter().find(|t| t.id_str() == tid)
+                    else {
+                        continue;
+                    };
+                    let Some(entries) =
+                        serde_json::from_value::<Vec<ns_prompts::model::PromptEntry>>(
+                            entries_v.clone(),
+                        )
+                        .ok()
+                    else {
+                        continue;
+                    };
+                    for e in entries {
+                        let _ = store.save_entry(*tool, e);
+                    }
+                }
+            }
+        }
+
+        // 工作区恢复：写回 OpenClaw openclaw.json + Hermes config.yaml。
+        if let Some(v) = extras.get("workspace").and_then(|v| v.as_object()) {
+            if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+                let files: [(&str, std::path::PathBuf); 2] = [
+                    ("openclaw", home.join(".openclaw").join("openclaw.json")),
+                    ("hermes", home.join(".hermes").join("config.yaml")),
+                ];
+                for (key, path) in files {
+                    if let Some(text) = v.get(key).and_then(|x| x.as_str()) {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::write(&path, text);
+                    }
+                }
+            }
+        }
+        self.status = "已恢复项目扩展状态（MCP/Skills/Prompts/工作区）".into();
+
+        cx.notify();
     }
 
     /// 渲染 M11 项目快照页：保存当前状态、整组切换、自动回存。
@@ -2095,6 +4331,11 @@ impl SwitchApp {
             .read()
             .map(|s| s.list_projects())
             .unwrap_or_default();
+        let active: Option<String> = self
+            .store
+            .read()
+            .ok()
+            .and_then(|s| s.active_project_for(self.active_tool));
         div()
             .id("projects-scroll")
             .flex_1()
@@ -2111,13 +4352,13 @@ impl SwitchApp {
                         div()
                             .text_size(px(16.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("项目快照"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("保存当前供应商 + 聚合为一项目，一键整组切换"),
                     ),
             )
@@ -2136,9 +4377,10 @@ impl SwitchApp {
                                     cx.notify();
                                     return;
                                 }
+                                let extras = this.project_extras(cx);
                                 let ok = {
                                     let mut s = this.store.write().expect("store lock");
-                                    s.save_project(&name).is_ok()
+                                    s.save_project(&name, ns_store::Store::scope_for(this.active_tool), &extras).is_ok()
                                 };
                                 this.status = if ok {
                                     format!("已保存项目 {name}")
@@ -2163,29 +4405,51 @@ impl SwitchApp {
                             .gap(px(10.))
                             .p(px(10.))
                             .rounded(px(8.))
-                            .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                            .bg(theme::panel_a(0.5))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.1))
+                            .border_color(theme::stroke_a(0.1))
                             .child(
                                 div()
                                     .flex_1()
                                     .text_size(px(13.))
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        widgets::ghost_button(
+                                            gpui::ElementId::from((
+                                                "project-current-badge",
+                                                i,
+                                            )),
+                                            "当前",
+                                        )
+                                        .when(active.as_deref() != Some(name.as_str()), |b| {
+                                            b.hidden()
+                                        }),
+                                    ),
                             )
                             .child(
                                 widgets::ghost_button(("project-apply", i), "应用").on_click(
                                     cx.listener(move |this, _, _, cx| {
-                                        let ok = {
+                                        let current_extras = this.project_extras(cx);
+                                        let target_extras = {
                                             let mut s = this.store.write().expect("store lock");
-                                            s.apply_project(&n).is_ok()
+                                            s.apply_project(&n, ns_store::Store::scope_for(this.active_tool), &current_extras).ok()
                                         };
-                                        this.status = if ok {
-                                            format!("已切换到项目 {n}")
-                                        } else {
-                                            format!("应用项目 {n} 失败")
-                                        };
-                                        cx.notify();
+                                        match target_extras {
+                                            Some(ext) => {
+                                                this.apply_project_extras(&ext, cx);
+                                            }
+                                            None => {
+                                                this.status = format!("应用项目 {n} 失败");
+                                                cx.notify();
+                                            }
+                                        }
                                     }),
                                 ),
                             )
@@ -2205,8 +4469,65 @@ impl SwitchApp {
             )
     }
 
+
+    /// 后台轮询 OAuth device-code（参考 cc-switch `auth_poll_for_account`）。
+    fn start_oauth_poll(&mut self, cx: &mut Context<Self>) {
+        let Some((provider, session, account_id, account_name)) = self.oauth_login.clone() else {
+            return;
+        };
+        let store = self.store.clone();
+        cx.spawn(async move |this, cx| {
+            let mut session = session;
+            loop {
+                match session.poll() {
+                    Ok(Some(token)) => {
+                        let login_result = {
+                            let mut s = store.write().expect("store lock");
+                            s.login_account(&account_id, &account_name, &provider, &token)
+                        };
+                        this.update(cx, |this, cx| {
+                            this.oauth_login = None;
+                            this.status = match login_result {
+                                Ok(()) => format!(
+                                    "已登录 {account_name}（OAuth 成功，token 摘要 {}）",
+                                    &token[..token.len().min(8)]
+                                ),
+                                Err(e) => format!("登录失败: {e}"),
+                            };
+                            cx.notify();
+                        })
+                        .ok();
+                        break;
+                    }
+                    Ok(None) => {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(3))
+                            .await;
+                    }
+                    Err(e) => {
+                        this.update(cx, |this, cx| {
+                            this.oauth_login = None;
+                            this.status = format!("OAuth 失败: {e}");
+                            cx.notify();
+                        })
+                        .ok();
+                        break;
+                    }
+                }
+                let _ = &provider;
+            }
+        })
+        .detach();
+    }
     /// 渲染 M11 托管账号页（Beta：Copilot / ChatGPT / xAI 订阅作为供应商）。
     fn render_accounts_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = crate::i18n::Lang::parse(
+            &self
+                .store
+                .read()
+                .map(|s| s.config().settings.language.clone())
+                .unwrap_or_else(|_| "zh-cn".into()),
+        );
         let accounts: Vec<(String, bool)> = {
             let s = self.store.read().expect("store lock");
             [
@@ -2242,14 +4563,14 @@ impl SwitchApp {
                         div()
                             .text_size(px(16.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child("授权中心"),
+                            .text_color(theme::text())
+                            .child(crate::i18n::t(lang, "auth.title")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("CLI 工具凭据与托管订阅（Claude Desktop / Codex / Copilot / ChatGPT / xAI）"),
+                            .text_color(theme::text_faint())
+                            .child(crate::i18n::t(lang, "auth.subtitle")),
                     ),
             )
             .child(
@@ -2260,7 +4581,7 @@ impl SwitchApp {
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("CLI 工具凭据"),
                     )
                     .child(
@@ -2281,9 +4602,9 @@ impl SwitchApp {
                                     .gap(px(10.))
                                     .p(px(10.))
                                     .rounded(px(8.))
-                                    .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                                    .bg(theme::panel_a(0.5))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.1))
+                                    .border_color(theme::stroke_a(0.1))
                                     .child(
                                         div()
                                             .flex_1()
@@ -2292,7 +4613,7 @@ impl SwitchApp {
                                             .child(
                                                 div()
                                                     .text_size(px(13.))
-                                                    .text_color(rgb(theme::TEXT))
+                                                    .text_color(theme::text())
                                                     .child(name.clone()),
                                             )
                                             .child(
@@ -2312,13 +4633,13 @@ impl SwitchApp {
                                             .child(
                                                 div()
                                                     .text_size(px(10.))
-                                                    .text_color(rgb(theme::TEXT_FAINT))
+                                                    .text_color(theme::text_faint())
                                                     .child(path),
                                             )
                                             .child(if let Some(e) = s.error.clone() {
                                                 div()
                                                     .text_size(px(10.))
-                                                    .text_color(rgb(theme::DANGER))
+                                                    .text_color(theme::danger())
                                                     .child(format!("读取失败: {e}"))
                                             } else {
                                                 div()
@@ -2369,9 +4690,9 @@ impl SwitchApp {
                             .gap(px(10.))
                             .p(px(10.))
                             .rounded(px(8.))
-                            .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                            .bg(theme::panel_a(0.5))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.1))
+                            .border_color(theme::stroke_a(0.1))
                             .child(
                                 div()
                                     .flex_1()
@@ -2380,7 +4701,7 @@ impl SwitchApp {
                                     .child(
                                         div()
                                             .text_size(px(13.))
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(format!("{name} ({id})")),
                                     )
                                     .child(
@@ -2412,17 +4733,63 @@ impl SwitchApp {
                             } else {
                                 widgets::ghost_button(("account-login", i), "登录").on_click(
                                     cx.listener(move |this, _, _, cx| {
-                                        let _ = {
-                                            let mut s = this.store.write().expect("store lock");
-                                            s.login_account(&id2, name)
+                                        // 真实 OAuth device-code 流程（参考 cc-switch）。
+                                        let provider = match id2.as_str() {
+                                            "xai" => "xai",
+                                            "copilot" => "copilot",
+                                            _ => "codex", // chatgpt → Codex OAuth
                                         };
-                                        this.status = format!("已登录 {name}（Beta：OAuth 占位）");
+                                        match crate::auth::start_device_flow(provider) {
+                                            Ok(session) => {
+                                                let user_code = session.user_code.clone();
+                                                let uri = session.verification_uri.clone();
+                                                let device_code = session.device_code.clone();
+                                                let expires_in = session.expires_in;
+                                                let interval = session.interval;
+                                                this.oauth_login = Some((
+                                                    provider.to_string(),
+                                                    session,
+                                                    id2.clone(),
+                                                    name.to_string(),
+                                                ));
+                                                this.status = format!(
+                                                    "请在浏览器打开 {uri} 输入代码 {user_code}（{expires_in} 秒内有效，每 {interval}s 轮询，设备码 {device_code}）"
+                                                );
+                                                this.start_oauth_poll(cx);
+                                            }
+                                            Err(e) => {
+                                                this.status = format!("OAuth 启动失败: {e}");
+                                            }
+                                        }
                                         cx.notify();
                                     }),
                                 )
                             })
                     }))
             )
+            .child(if let Some((provider, session, _, _)) = &self.oauth_login {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::accent_a(0.08))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.32))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "OAuth 登录中（{}）：浏览器输入代码 {}",
+                                if provider == "xai" { "xAI" } else { "Codex" },
+                                session.user_code
+                            )),
+                    )
+            } else {
+                div()
+            })
     }
 
     /// 渲染工具配置页：OpenClaw 工作区指令 + Hermes 记忆。
@@ -2444,14 +4811,86 @@ impl SwitchApp {
                         div()
                             .text_size(px(16.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("工具配置"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("OpenClaw 工作区指令与 Hermes 持久记忆（文件不存在时保存即创建）"),
+                    ),
+            )
+            .child({
+                // OpenClaw / Hermes 配置健康横幅。
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let oc_json = home
+                    .as_ref()
+                    .map(|h| h.join(".openclaw").join("openclaw.json"));
+                let hermes_yaml = home
+                    .as_ref()
+                    .map(|h| h.join(".hermes").join("config.yaml"));
+                let oc_ok = oc_json.as_ref().is_some_and(|p| p.exists());
+                let oc_valid = oc_json
+                    .as_ref()
+                    .filter(|p| p.exists())
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .is_some_and(|t| serde_json::from_str::<serde_json::Value>(&t).is_ok());
+                let hm_ok = hermes_yaml.as_ref().is_some_and(|p| p.exists());
+                let tone = if oc_ok && oc_valid {
+                    theme::jade()
+                } else if oc_ok {
+                    theme::cinnabar()
+                } else {
+                    theme::text_faint()
+                };
+                let text = match (oc_ok, oc_valid, hm_ok) {
+                    (true, true, true) => "OpenClaw 配置有效 · Hermes 配置存在".to_string(),
+                    (true, true, false) => "OpenClaw 配置有效 · Hermes 未初始化".to_string(),
+                    (true, false, _) => "OpenClaw openclaw.json 存在但 JSON 解析失败（请检查）".to_string(),
+                    (false, _, true) => "OpenClaw 未初始化 · Hermes 配置存在".to_string(),
+                    (false, _, false) => "OpenClaw / Hermes 均未初始化（编辑保存即创建）".to_string(),
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(12.))
+                    .h(px(30.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.4))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.1))
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(tone),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child(text),
+                    )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        widgets::ghost_button("oc-defaults-open", "代理默认值").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.open_openclaw_defaults(cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(theme::text_faint())
+                            .child("agents.defaults · 主模型/工作区/超时/并发"),
                     ),
             )
             .child(
@@ -2473,9 +4912,9 @@ impl SwitchApp {
                             .gap(px(10.))
                             .p(px(10.))
                             .rounded(px(8.))
-                            .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                            .bg(theme::panel_a(0.5))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.1))
+                            .border_color(theme::stroke_a(0.1))
                             .child(
                                 div()
                                     .flex_1()
@@ -2484,13 +4923,13 @@ impl SwitchApp {
                                     .child(
                                         div()
                                             .text_size(px(13.))
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(label),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(rgb(theme::TEXT_FAINT))
+                                            .text_color(theme::text_faint())
                                             .child(hint),
                                     )
                                     .child(
@@ -2521,6 +4960,138 @@ impl SwitchApp {
                             )
                     })),
             )
+            .child({
+                // OpenClaw 每日记忆区。
+                let today = crate::toolconfig::today_daily_memory_filename();
+                let today_exists = crate::toolconfig::daily_memory_dir()
+                    .map(|d| d.join(&today).exists())
+                    .unwrap_or(false);
+                let files = crate::toolconfig::list_daily_memory();
+                div()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child("OpenClaw 每日记忆"),
+                            )
+                            .child(
+                                widgets::primary_button(
+                                    gpui::ElementId::from(gpui::SharedString::from(
+                                        "dm-new-today",
+                                    )),
+                                    if today_exists { "编辑今日笔记" } else { "新建今日笔记" },
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_daily_memory(
+                                        &crate::toolconfig::today_daily_memory_filename(),
+                                        cx,
+                                    );
+                                })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(format!(
+                                "~/.openclaw/workspace/memory/{today}{}",
+                                if today_exists { " · 已存在" } else { " · 今日尚未创建" }
+                            )),
+                    )
+                    .child(if files.is_empty() {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("暂无每日记忆（新建今日笔记后出现在此）")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex_col()
+                            .gap(px(6.))
+                            .children(files.into_iter().map(|f| {
+                                let name = f.filename.clone();
+                                let date = f.date.clone();
+                                let size = f.size_bytes;
+                                let modified = f.modified_at;
+                                let mtime = if modified > 0 {
+                                    let secs = modified / 1000;
+                                    let days = secs.div_euclid(86400) as i64;
+                                    let rem = secs.rem_euclid(86400);
+                                    let (y, m, d) = crate::toolconfig::civil_from_days(days);
+                                    let hh = rem / 3600;
+                                    let mm = (rem % 3600) / 60;
+                                    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+                                } else {
+                                    "—".to_string()
+                                };
+                                div()
+                                    .id(gpui::ElementId::from(gpui::SharedString::from(
+                                        format!("dm-{name}"),
+                                    )))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .p(px(10.))
+                                    .rounded(px(8.))
+                                    .bg(theme::panel_a(0.5))
+                                    .border_1()
+                                    .border_color(theme::stroke_a(0.1))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.))
+                                                    .text_color(theme::text())
+                                                    .child(date.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(theme::text_faint())
+                                                    .child(format!("{size} 字节 · 修改于 {mtime}")),
+                                            ),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(
+                                            gpui::ElementId::from(gpui::SharedString::from(
+                                                format!("dm-edit-{name}"),
+                                            )),
+                                            "编辑",
+                                        )
+                                        .on_click(cx.listener({
+                                            let n = name.clone();
+                                            move |this, _, _, cx| {
+                                                this.open_daily_memory(&n, cx);
+                                            }
+                                        })),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(
+                                            gpui::ElementId::from(gpui::SharedString::from(
+                                                format!("dm-del-{name}"),
+                                            )),
+                                            "删除",
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.daily_memory_confirm_delete = Some(name.clone());
+                                            cx.notify();
+                                        })),
+                                    )
+                            }))
+                            .into_any_element()
+                    })
+            })
     }
 
     /// 打开工具配置编辑器（预填内容）。
@@ -2568,7 +5139,444 @@ impl SwitchApp {
         cx.notify();
     }
 
+    /// 打开每日记忆编辑器（预填内容；不存在则空白）。
+    fn open_daily_memory(&mut self, filename: &str, cx: &mut Context<Self>) {
+        if !crate::toolconfig::is_daily_memory_filename(filename) {
+            self.status = format!("无效文件名: {filename}");
+            self.status_tone = StatusTone::Error;
+            cx.notify();
+            return;
+        }
+        let content = match crate::toolconfig::read_daily_memory(filename) {
+            Ok(Some(c)) => c,
+            Ok(None) => String::new(),
+            Err(e) => {
+                self.status = format!("读取失败: {e}");
+                self.status_tone = StatusTone::Error;
+                cx.notify();
+                return;
+            }
+        };
+        let editor = cx.new(|cx| {
+            let mut ta = crate::text_area::TextArea::new("", cx);
+            ta.set_text(&content);
+            ta
+        });
+        self.daily_memory_editing = Some(filename.to_string());
+        self.daily_memory_editor = Some(editor);
+        self.daily_memory_status = String::new();
+        cx.notify();
+    }
+
+    /// 保存每日记忆文件。
+    fn save_daily_memory(&mut self, cx: &mut Context<Self>) {
+        let Some(filename) = self.daily_memory_editing.clone() else {
+            return;
+        };
+        let content = self
+            .daily_memory_editor
+            .as_ref()
+            .map(|e| e.read(cx).text())
+            .unwrap_or_default();
+        match crate::toolconfig::write_daily_memory(&filename, &content) {
+            Ok(()) => {
+                self.daily_memory_status = format!("已保存 {filename}");
+                self.status = format!("已保存每日记忆 {filename}");
+                self.status_tone = StatusTone::Success;
+                self.daily_memory_files = crate::toolconfig::list_daily_memory();
+            }
+            Err(e) => {
+                self.daily_memory_status = format!("保存失败: {e}");
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 渲染每日记忆编辑器浮层。
+    fn render_daily_memory_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(filename) = self.daily_memory_editing.clone() else {
+            return div().into_any_element();
+        };
+        let editor = self
+            .daily_memory_editor
+            .clone()
+            .unwrap_or_else(|| cx.new(|inner| crate::text_area::TextArea::new("", inner)));
+        div()
+            .id("daily-memory-editor-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x000000, 0.5))
+            .child(
+                div()
+                    .id("daily-memory-editor-panel")
+                    .w(px(640.))
+                    .max_h(px(520.))
+                    .flex_col()
+                    .rounded(px(12.))
+                    .bg(theme::bg_1())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.2))
+                    .p(px(16.))
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(theme::text())
+                                    .child(format!("每日记忆 · {filename}")),
+                            )
+                            .child(
+                                widgets::ghost_button("dm-editor-close", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.daily_memory_editing = None;
+                                        this.daily_memory_editor = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(280.))
+                            .rounded(px(8.))
+                            .bg(theme::alpha(0x000000, 0.25))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.14))
+                            .child(editor),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if self.daily_memory_status.is_empty() {
+                                        theme::TEXT_FAINT
+                                    } else {
+                                        theme::ACCENT
+                                    }))
+                                    .child(if self.daily_memory_status.is_empty() {
+                                        "Markdown 文本（保存即写盘）".to_string()
+                                    } else {
+                                        self.daily_memory_status.clone()
+                                    }),
+                            )
+                            .child(
+                                widgets::ghost_button("dm-editor-save", "保存").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.save_daily_memory(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 渲染每日记忆删除确认浮层。
+    fn render_daily_memory_confirm_delete(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(filename) = self.daily_memory_confirm_delete.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .id("dm-delete-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x000000, 0.55))
+            .child(
+                div()
+                    .w(px(360.))
+                    .rounded(px(14.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::danger_a(0.4))
+                    .shadow_lg()
+                    .p(px(18.))
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::danger())
+                            .child("删除每日记忆"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text())
+                            .child(format!("确定删除「{filename}」？此操作不可撤销。")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("dm-del-cancel", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.daily_memory_confirm_delete = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::danger_button("dm-del-confirm", "确认删除")
+                                    .on_click(cx.listener(move |this, _, _, _cx| {
+                                        let result =
+                                            crate::toolconfig::delete_daily_memory(&filename);
+                                        this.daily_memory_confirm_delete = None;
+                                        let ok = result.is_ok();
+                                        this.status = match result {
+                                            Ok(()) => format!("已删除每日记忆 {filename}"),
+                                            Err(e) => format!("删除失败: {e}"),
+                                        };
+                                        this.status_tone = if ok {
+                                            StatusTone::Success
+                                        } else {
+                                            StatusTone::Error
+                                        };
+                                        if ok {
+                                            this.daily_memory_files =
+                                                crate::toolconfig::list_daily_memory();
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 打开 OpenClaw `agents.defaults` 结构化编辑器（预填当前值）。
+    fn open_openclaw_defaults(&mut self, cx: &mut Context<Self>) {
+        self.oc_defaults = crate::toolconfig::OpenClawAgentsDefaults::from_openclaw_json();
+        let d = self.oc_defaults.clone();
+        let primary = d.model.as_ref().map(|m| m.primary.clone()).unwrap_or_default();
+        if let Some(e) = self.oc_defaults_inputs.primary.as_ref() {
+            e.update(cx, |f, _| f.set_text(&primary));
+        }
+        if let Some(e) = self.oc_defaults_inputs.workspace.as_ref() {
+            e.update(cx, |f, _| f.set_text(d.workspace.as_deref().unwrap_or_default()));
+        }
+        if let Some(e) = self.oc_defaults_inputs.timeout.as_ref() {
+            e.update(cx, |f, _| f.set_text(&d.timeout_seconds.map(|v| v.to_string()).unwrap_or_default()));
+        }
+        if let Some(e) = self.oc_defaults_inputs.context_tokens.as_ref() {
+            e.update(cx, |f, _| f.set_text(&d.context_tokens.map(|v| v.to_string()).unwrap_or_default()));
+        }
+        if let Some(e) = self.oc_defaults_inputs.max_concurrent.as_ref() {
+            e.update(cx, |f, _| f.set_text(&d.max_concurrent.map(|v| v.to_string()).unwrap_or_default()));
+        }
+        self.openclaw_defaults_open = true;
+        cx.notify();
+    }
+
+    /// 保存 OpenClaw `agents.defaults`。
+    fn save_openclaw_defaults(&mut self, cx: &mut Context<Self>) {
+        let text = |e: &Option<gpui::Entity<crate::text_field::TextField>>| {
+            e.as_ref()
+                .map(|x| x.read(cx).text().trim().to_string())
+                .unwrap_or_default()
+        };
+        let primary = text(&self.oc_defaults_inputs.primary);
+        let workspace = text(&self.oc_defaults_inputs.workspace);
+        let timeout = text(&self.oc_defaults_inputs.timeout);
+        let ctx = text(&self.oc_defaults_inputs.context_tokens);
+        let maxc = text(&self.oc_defaults_inputs.max_concurrent);
+        let parse_u64 = |s: &str| -> Option<u64> {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<u64>().ok()
+            }
+        };
+        // 从当前 oc_defaults 继承未知字段（extra）。
+        let mut d = self.oc_defaults.clone();
+        d.model = if primary.is_empty() {
+            None
+        } else {
+            Some(crate::toolconfig::OpenClawDefaultModel {
+                primary,
+                fallbacks: d.model.as_ref().and_then(|m| m.fallbacks.clone()),
+            })
+        };
+        d.workspace = if workspace.is_empty() { None } else { Some(workspace) };
+        d.timeout_seconds = parse_u64(&timeout);
+        d.context_tokens = parse_u64(&ctx);
+        d.max_concurrent = parse_u64(&maxc);
+        match d.save_to_openclaw_json() {
+            Ok(()) => {
+                self.oc_defaults_status = "已保存 agents.defaults".to_string();
+                self.status = "已保存 OpenClaw agents.defaults".to_string();
+                self.status_tone = StatusTone::Success;
+                self.oc_defaults = d;
+            }
+            Err(e) => {
+                self.oc_defaults_status = format!("保存失败: {e}");
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 渲染 OpenClaw `agents.defaults` 结构化编辑器浮层。
+    fn render_openclaw_defaults_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.openclaw_defaults_open {
+            return div().into_any_element();
+        }
+        let exists = crate::toolconfig::openclaw_agents_defaults_exists();
+        let field = |label: String, e: gpui::Entity<crate::text_field::TextField>| {
+            div()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_dim())
+                        .child(label),
+                )
+                .child(e)
+        };
+        let primary = self.oc_defaults_inputs.primary.clone().unwrap_or_else(|| cx.new(|cx| crate::text_field::TextField::new("", cx)));
+        let workspace = self.oc_defaults_inputs.workspace.clone().unwrap_or_else(|| cx.new(|cx| crate::text_field::TextField::new("", cx)));
+        let timeout = self.oc_defaults_inputs.timeout.clone().unwrap_or_else(|| cx.new(|cx| crate::text_field::TextField::new("", cx)));
+        let context_tokens = self.oc_defaults_inputs.context_tokens.clone().unwrap_or_else(|| cx.new(|cx| crate::text_field::TextField::new("", cx)));
+        let max_concurrent = self.oc_defaults_inputs.max_concurrent.clone().unwrap_or_else(|| cx.new(|cx| crate::text_field::TextField::new("", cx)));
+        div()
+            .id("oc-defaults-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x000000, 0.5))
+            .child(
+                div()
+                    .id("oc-defaults-panel")
+                    .w(px(520.))
+                    .max_h(px(560.))
+                    .flex_col()
+                    .rounded(px(12.))
+                    .bg(theme::bg_1())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.2))
+                    .p(px(16.))
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(14.))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(theme::text())
+                                            .child("OpenClaw 代理默认值"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(theme::text_faint())
+                                            .child(if exists {
+                                                "openclaw.json · agents.defaults（已有配置，保存覆盖已知字段、保留未知字段）"
+                                            } else {
+                                                "openclaw.json · agents.defaults（保存即创建）"
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                widgets::ghost_button("oc-defaults-close", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.openclaw_defaults_open = false;
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_col()
+                                    .gap(px(10.))
+                                    .child(field("主模型（model.primary）".to_string(), primary))
+                                    .child(field("工作区（workspace）".to_string(), workspace))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap(px(10.))
+                                            .child(
+                                                field("超时（timeoutSeconds）".to_string(), timeout).flex_1(),
+                                            )
+                                            .child(
+                                                field(
+                                                    "上下文 token（contextTokens）".to_string(),
+                                                    context_tokens,
+                                                )
+                                                .flex_1(),
+                                            ),
+                                    )
+                                    .child(field("最大并发（maxConcurrent）".to_string(), max_concurrent)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if self.oc_defaults_status.is_empty() {
+                                        theme::TEXT_FAINT
+                                    } else {
+                                        theme::ACCENT
+                                    }))
+                                    .child(if self.oc_defaults_status.is_empty() {
+                                        "保存写回 openclaw.json（保留未知字段）".to_string()
+                                    } else {
+                                        self.oc_defaults_status.clone()
+                                    }),
+                            )
+                            .child(
+                                widgets::primary_button("oc-defaults-save", "保存").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.save_openclaw_defaults(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// 渲染工具配置编辑器浮层。
+
+    /// 渲染工具配置编辑器浮层。
+
     fn render_toolconfig_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(id) = self.toolconfig_id.clone() else {
             return div().into_any_element();
@@ -2595,9 +5603,9 @@ impl SwitchApp {
                     .max_h(px(520.))
                     .flex_col()
                     .rounded(px(12.))
-                    .bg(theme::color(theme::BG_1))
+                    .bg(theme::bg_1())
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.2))
+                    .border_color(theme::stroke_a(0.2))
                     .p(px(16.))
                     .gap(px(10.))
                     .child(
@@ -2609,7 +5617,7 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(14.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(format!("编辑 · {label}")),
                             )
                             .child(
@@ -2630,7 +5638,7 @@ impl SwitchApp {
                             .rounded(px(8.))
                             .bg(theme::alpha(0x000000, 0.25))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.14))
+                            .border_color(theme::stroke_a(0.14))
                             .child(editor),
                     )
                     .child(
@@ -2666,6 +5674,13 @@ impl SwitchApp {
 
     /// 渲染 M12 设置页：自动更新、深链导入、版本。
     fn render_settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = crate::i18n::Lang::parse(
+            &self
+                .store
+                .read()
+                .map(|s| s.config().settings.language.clone())
+                .unwrap_or_else(|_| "zh-cn".into()),
+        );
         let status = self.update_status.clone();
         let backups = self.store.read().map(|s| s.list_backups()).unwrap_or_default();
         // 环境冲突告警：路由模式下多工具共用同一监听端口。
@@ -2707,30 +5722,44 @@ impl SwitchApp {
                         div()
                             .text_size(px(16.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child("设置"),
+                            .text_color(theme::text())
+                            .child(crate::i18n::t(lang, "settings.title")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("自动更新、深链导入"),
                     ),
             )
-            .child(
+            .child(self.render_settings_section_tabs(cx))
+            .when(
+                self.settings_section == SettingsSection::AppConfig,
+                |el| el.child(self.render_settings_appconfig(cx)),
+            )
+            .when(
+                self.settings_section == SettingsSection::Routing,
+                |el| el.child(self.render_settings_routing(cx)),
+            )
+            .when(
+                self.settings_section == SettingsSection::Network,
+                |el| el.child(self.render_settings_network(cx)),
+            )
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
                 div()
                     .flex_col()
                     .gap(px(6.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.3))
+                    .bg(theme::panel_a(0.3))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(theme::TEXT))
-                            .child("主题"),
+                            .text_color(theme::text())
+                            .child(crate::i18n::t(lang, "settings.theme")),
                     )
                     .child(
                         div()
@@ -2744,9 +5773,9 @@ impl SwitchApp {
                                         .map(|s| s.config().settings.theme.clone())
                                         .unwrap_or_else(|_| "dark".into());
                                     let label = match mode {
-                                        "light" => "浅色",
-                                        "system" => "跟随系统",
-                                        _ => "深色",
+                                        "light" => crate::i18n::t(lang, "theme.light"),
+                                        "system" => crate::i18n::t(lang, "theme.system"),
+                                        _ => crate::i18n::t(lang, "theme.dark"),
                                     };
                                     widgets::ghost_button(
                                         gpui::ElementId::from(gpui::SharedString::from(
@@ -2760,15 +5789,18 @@ impl SwitchApp {
                                                 this.store.write().expect("store lock");
                                             s.set_theme(mode)
                                         };
+                                        ns_ui::theme::set_active_mode(
+                                            ns_ui::theme::ThemeMode::parse(mode),
+                                        );
                                         this.status =
                                             format!("主题已切换为 {label}");
                                         cx.notify();
                                     }))
                                     .map(|b| {
                                         if cur == mode {
-                                            b.bg(theme::alpha(theme::ACCENT, 0.18))
+                                            b.bg(theme::accent_a(0.18))
                                                 .border_1()
-                                                .border_color(theme::alpha(theme::ACCENT, 0.5))
+                                                .border_color(theme::accent_a(0.5))
                                         } else {
                                             b
                                         }
@@ -2776,35 +5808,37 @@ impl SwitchApp {
                                 }),
                             ),
                     ),
-            )
-            .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(10.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                    .bg(theme::panel_a(0.5))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.1))
+                    .border_color(theme::stroke_a(0.1))
                     .child(
                         div()
                             .flex_1()
                             .text_size(px(13.))
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(if crate::autostart::is_enabled() {
-                                "开机自启：已开启"
+                                crate::i18n::t(lang, "settings.autostart.on")
                             } else {
-                                "开机自启：关闭"
+                                crate::i18n::t(lang, "settings.autostart.off")
                             }),
                     )
                     .child(
                         widgets::ghost_button(
                             "autostart-toggle",
                             if crate::autostart::is_enabled() {
-                                "关闭自启"
+                                crate::i18n::t(lang, "settings.autostart.disable")
                             } else {
-                                "开启自启"
+                                crate::i18n::t(lang, "settings.autostart.enable")
                             },
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2826,21 +5860,23 @@ impl SwitchApp {
                             cx.notify();
                         })),
                     ),
-            )
-            .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
                 div()
                     .flex_col()
                     .gap(px(6.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.3))
+                    .bg(theme::panel_a(0.3))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(theme::TEXT))
-                            .child("语言"),
+                            .text_color(theme::text())
+                            .child(crate::i18n::t(lang, "settings.language")),
                     )
                     .child(
                         div()
@@ -2877,7 +5913,7 @@ impl SwitchApp {
                                         }))
                                         .map(|b| {
                                             if cur == code {
-                                                b.bg(theme::alpha(theme::ACCENT, 0.18))
+                                                b.bg(theme::accent_a(0.18))
                                                     .border_1()
                                                     .border_color(theme::alpha(
                                                         theme::ACCENT,
@@ -2890,20 +5926,22 @@ impl SwitchApp {
                                     }),
                             ),
                     ),
-            )
-            .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
                 div()
                     .flex_col()
                     .gap(px(6.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.3))
+                    .bg(theme::panel_a(0.3))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("小工具"),
                     )
                     .child(
@@ -2914,7 +5952,7 @@ impl SwitchApp {
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
                                     .child("跳过初次确认（CLAUDE_CODE_SKIP_VERIFY_AUTH）"),
                             )
                             .child(
@@ -2944,7 +5982,7 @@ impl SwitchApp {
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
                                     .child("隐藏署名（CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC）"),
                             )
                             .child(
@@ -2974,7 +6012,7 @@ impl SwitchApp {
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
                                     .child("VS Code 联动（code CLI）"),
                             )
                             .child(
@@ -2992,8 +6030,10 @@ impl SwitchApp {
                                     }),
                             ),
                     ),
-            )
-            .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
                 div()
                     .flex()
                     .items_center()
@@ -3001,7 +6041,7 @@ impl SwitchApp {
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child("顶部项目切换器"),
                     )
                     .child(
@@ -3038,22 +6078,195 @@ impl SwitchApp {
                             cx.notify();
                         })),
                     ),
-            )
-             .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::text_dim())
+                                    .child("共享 Skills 目录"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(theme::text_faint())
+                                    .child("所有工具共用 ~/.agents/skills"),
+                            ),
+                    )
+                    .child(
+                        widgets::ghost_button(
+                            "gadget-shared-skills",
+                            if self
+                                .store
+                                .read()
+                                .map(|s| s.config().settings.shared_skills)
+                                .unwrap_or(false)
+                            {
+                                "开启"
+                            } else {
+                                "关闭"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = !this
+                                .store
+                                .read()
+                                .map(|s| s.config().settings.shared_skills)
+                                .unwrap_or(false);
+                            let r = {
+                                let mut s = this.store.write().expect("store lock");
+                                s.set_shared_skills(next)
+                            };
+                            this.status = match r {
+                                Ok(()) => format!(
+                                    "共享 Skills 目录：{}",
+                                    if next { "开启" } else { "关闭" }
+                                ),
+                                Err(e) => format!("写入失败: {e}"),
+                            };
+                            this.skills.shared = next;
+                            cx.notify();
+                        })),
+                    ),
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
+                el.child(
+                div()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(widgets::section_label("侧栏工具"))
+                    .children({
+                        let store = self.store.read().expect("store lock");
+                        let items: Vec<(Tool, bool)> = store
+                            .tool_order()
+                            .into_iter()
+                            .map(|t| (t, store.tool_visible(t)))
+                            .collect();
+                        items.into_iter().enumerate().map(|(i, (tool, visible))| {
+                            div()
+                                .id(("app-vis-row", tool as usize))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .p(px(8.))
+                                .rounded(px(6.))
+                                .bg(theme::panel_a(0.4))
+                                .child(
+                                    div()
+                                        .w(px(18.))
+                                        .text_size(px(12.))
+                                        .text_color(theme::text_faint())
+                                        .child(tool.glyph()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(12.))
+                                        .text_color(theme::text())
+                                        .child(tool.label()),
+                                )
+                                .child(
+                                    widgets::ghost_button(
+                                        ("app-vis-toggle", tool as usize),
+                                        if visible { "隐藏" } else { "显示" },
+                                    )
+                                    .on_click({
+                                        let t = tool;
+                                        cx.listener(move |this, _, _, cx| {
+                                            let cur = this
+                                                .store
+                                                .read()
+                                                .map(|s| s.tool_visible(t))
+                                                .unwrap_or(true);
+                                            let r = {
+                                                let mut s =
+                                                    this.store.write().expect("store lock");
+                                                s.set_tool_visible(t, !cur)
+                                            };
+                                            this.status = match r {
+                                                Ok(()) => format!(
+                                                    "{} 已{}",
+                                                    t.label(),
+                                                    if !cur { "显示" } else { "隐藏" }
+                                                ),
+                                                Err(e) => format!("写入失败: {e}"),
+                                            };
+                                            cx.notify();
+                                        })
+                                    }),
+                                )
+                                .child(
+                                    widgets::ghost_button(
+                                        ("app-vis-up", tool as usize),
+                                        "↑",
+                                    )
+                                    .on_click({
+                                        let t = tool;
+                                        cx.listener(move |this, _, _, cx| {
+                                            let r = {
+                                                let mut s =
+                                                    this.store.write().expect("store lock");
+                                                s.move_tool(t, i as isize - 1)
+                                            };
+                                            this.status = match r {
+                                                Ok(()) => "顺序已更新".into(),
+                                                Err(e) => format!("写入失败: {e}"),
+                                            };
+                                            cx.notify();
+                                        })
+                                    }),
+                                )
+                                .child(
+                                    widgets::ghost_button(
+                                        ("app-vis-down", tool as usize),
+                                        "↓",
+                                    )
+                                    .on_click({
+                                        let t = tool;
+                                        cx.listener(move |this, _, _, cx| {
+                                            let r = {
+                                                let mut s =
+                                                    this.store.write().expect("store lock");
+                                                s.move_tool(t, i as isize + 2)
+                                            };
+                                            this.status = match r {
+                                                Ok(()) => "顺序已更新".into(),
+                                                Err(e) => format!("写入失败: {e}"),
+                                            };
+                                            cx.notify();
+                                        })
+                                    }),
+                                )
+                        })
+                    }),
+                )
+            })
+            .when(self.settings_section == SettingsSection::About, |el| {
+                el.child(
                  div()
                      .flex()
                     .items_center()
                     .gap(px(10.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                    .bg(theme::panel_a(0.5))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.1))
+                    .border_color(theme::stroke_a(0.1))
                     .child(
                         div()
                             .flex_1()
                             .text_size(px(13.))
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(format!(
                                 "版本 {}",
                                 crate::update::CURRENT_VERSION
@@ -3078,64 +6291,102 @@ impl SwitchApp {
                                 .detach();
                             }),
                         ),
-                    ),
-            )
-            .child(
+                    )
+                    .child(
+                        widgets::ghost_button("update-download", "下载并安装").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let tag = this
+                                    .update_status
+                                    .as_ref()
+                                    .and_then(|r| r.as_ref().ok())
+                                    .and_then(|s| {
+                                        s.strip_prefix("发现新版本 ")
+                                            .map(|v| v.to_string())
+                                    });
+                                let Some(tag) = tag else {
+                                    this.update_status = Some(Err("请先检查更新".into()));
+                                    cx.notify();
+                                    return;
+                                };
+                                this.update_status =
+                                    Some(Ok(format!("正在下载 {tag} …")));
+                                cx.notify();
+                                cx.spawn(async move |this, cx| {
+                                    let r = crate::update::download_and_install(&tag);
+                                    this.update(cx, |this, cx| {
+                                        this.update_status = Some(match r {
+                                            Ok(m) => Ok(m),
+                                            Err(e) => Err(e),
+                                        });
+                                        cx.notify();
+                                    })
+                                    .ok();
+                                })
+                                .detach();
+                            }),
+                        ),
+                    )
+                )
+            })
+            .when(self.settings_section == SettingsSection::Data, |el| {
+                el.child(
                 div()
                     .flex_col()
                     .gap(px(6.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.3))
+                    .bg(theme::panel_a(0.3))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("深链导入"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child(
                                 "nsswitch://import-provider?preset=claude-88api&endpoint=...&key=...&model=...",
                             ),
                     ),
-            )
-            .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::Data, |el| {
+                el.child(
                 div()
                     .flex_col()
                     .gap(px(6.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.3))
+                    .bg(theme::panel_a(0.3))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("备份与环境"),
                     )
                     .child(if conflicts.is_empty() {
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("无环境冲突")
                     } else {
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::DANGER))
+                            .text_color(theme::danger())
                             .child(conflicts.join("；"))
                     })
                     .child(if backups.is_empty() {
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("无首写备份")
                     } else {
                         div()
@@ -3152,7 +6403,7 @@ impl SwitchApp {
                                         div()
                                             .flex_1()
                                             .text_size(px(11.))
-                                            .text_color(rgb(theme::TEXT_DIM))
+                                            .text_color(theme::text_dim())
                                             .child(format!("{} · {} B · {}", b.name, b.size, b.source)),
                                     )
                                     .child(
@@ -3173,26 +6424,59 @@ impl SwitchApp {
                                     )
                             }))
                     })
-            )
-            .child(
+                )
+            })
+            .when(self.settings_section == SettingsSection::Data, |el| {
+                el.child(
                 div()
                     .flex_col()
                     .gap(px(6.))
                     .p(px(10.))
                     .rounded(px(8.))
-                    .bg(theme::alpha(theme::PANEL_SOLID, 0.3))
+                    .bg(theme::panel_a(0.3))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child("云同步（WebDAV）"),
+                            .text_color(theme::text())
+                            .child("云同步（WebDAV / S3）"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                widgets::pill(
+                                    "WebDAV",
+                                    if self.sync_provider != "s3" { theme::jade() } else { theme::text_faint() },
+                                ).id("sync-provider-webdav").cursor_pointer().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.sync_provider = "webdav".into();
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::pill(
+                                    "S3",
+                                    if self.sync_provider == "s3" { theme::jade() } else { theme::text_faint() },
+                                ).id("sync-provider-s3").cursor_pointer().on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.sync_provider = "s3".into();
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
                     )
                     .child(div().w_full().child(self.sync_url.clone()))
                     .child(div().w_full().child(self.sync_user.clone()))
                     .child(div().w_full().child(self.sync_pass.clone()))
+                    .when(self.sync_provider == "s3", |el| {
+                        el.child(div().w_full().child(self.sync_bucket.clone()))
+                    })
+                    .child(div().w_full().child(self.sync_interval.clone()))
                     .child(
                         div()
                             .flex()
@@ -3203,16 +6487,26 @@ impl SwitchApp {
                                         let url = this.sync_url.read(cx).text();
                                         let user = this.sync_user.read(cx).text();
                                         let pass = this.sync_pass.read(cx).text();
+                                        let bucket = this.sync_bucket.read(cx).text();
+                                        let interval = this
+                                            .sync_interval
+                                            .read(cx)
+                                            .text()
+                                            .trim()
+                                            .parse::<u32>()
+                                            .unwrap_or(0);
                                         let enabled = !url.is_empty();
+                                        let provider = this.sync_provider.clone();
                                         let ok = {
                                             let mut s = this.store.write().expect("store lock");
                                             s.set_sync_config(ns_store::SyncConfig {
-                                                provider: "webdav".into(),
+                                                provider,
                                                 url,
                                                 username: user,
                                                 password: pass,
-                                                bucket: String::new(),
+                                                bucket,
                                                 enabled,
+                                                auto_sync_minutes: interval,
                                             })
                                             .is_ok()
                                         };
@@ -3259,10 +6553,119 @@ impl SwitchApp {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child(self.sync_status.clone()),
                     ),
-            )
+                )
+            })
+            .when(self.settings_section == SettingsSection::Data, |el| {
+                let pricing = self
+                    .store
+                    .read()
+                    .map(|s| s.config().settings.custom_pricing.clone())
+                    .unwrap_or_default();
+                el.child(
+                div()
+                    .flex_col()
+                    .gap(px(6.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.3))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.08))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("自定义定价"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("覆盖内置价格表（USD/1M tokens）。用量页按此计算花费。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .child(div().flex_1().child(self.price_model.clone()))
+                            .child(div().w(px(110.)).child(self.price_input.clone()))
+                            .child(div().w(px(110.)).child(self.price_output.clone()))
+                            .child(div().w(px(130.)).child(self.price_cache.clone()))
+                            .child(
+                                widgets::primary_button("price-add", "添加").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_custom_price(cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::ghost_button("price-import-models", "导入 models.dev")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.import_models_dev_pricing(cx);
+                                    })),
+                            ),
+                    )
+                    .child(if pricing.is_empty() {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("无自定义定价")
+                    } else {
+                        div()
+                            .flex_col()
+                            .gap(px(4.))
+                            .children(pricing.into_iter().enumerate().map(|(i, (k, v))| {
+                                let key = k.clone();
+                                let desc = format!(
+                                    "{}：in {} / out {} / cache {}",
+                                    k,
+                                    v.get("input_per_mtok").and_then(|x| x.as_f64()).map(|x| format!("{x}")).unwrap_or_else(|| "?".into()),
+                                    v.get("output_per_mtok").and_then(|x| x.as_f64()).map(|x| format!("{x}")).unwrap_or_else(|| "?".into()),
+                                    v.get("cache_read_per_mtok").and_then(|x| x.as_f64()).map(|x| format!("{x}")).unwrap_or_else(|| "—".into()),
+                                );
+                                div()
+                                    .id(("price-row", i))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_size(px(11.))
+                                            .text_color(theme::text_dim())
+                                            .child(desc),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(("price-del", i), "删除").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                let ok = {
+                                                    let mut s = this.store.write().expect("store lock");
+                                                    s.remove_custom_price(&key).is_ok()
+                                                };
+                                                this.pricing_status = if ok {
+                                                    "已删除自定义定价".into()
+                                                } else {
+                                                    "删除失败".into()
+                                                };
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                            }))
+                    })
+                    .child(if !self.pricing_status.is_empty() {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child(self.pricing_status.clone())
+                    } else {
+                        div()
+                    })
+                )
+            })
             .child(if let Some(res) = status {
                 let (color, text) = match res {
                     Ok(t) => (theme::ACCENT, t),
@@ -3275,6 +6678,420 @@ impl SwitchApp {
             } else {
                 div()
             })
+    }
+
+    /// 设置页分区导航（对齐 cc-switch SettingsDirectory）。
+    fn render_settings_section_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .children(SettingsSection::ALL.into_iter().enumerate().map(|(i, section)| {
+                let selected = self.settings_section == section;
+                div()
+                    .id(("settings-section", i))
+                    .px(px(12.))
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .bg(if selected {
+                        theme::accent_a(0.18)
+                    } else {
+                        theme::surface_a(0.4)
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        theme::accent_a(0.5)
+                    } else {
+                        theme::stroke_a(0.1)
+                    })
+                    .text_color(if selected {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    })
+                    .text_size(px(12.))
+                    .child(section.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings_section = section;
+                        cx.notify();
+                    }))
+            }))
+    }
+
+    /// 应用配置分区：每个工具的配置目录与关键能力概览。
+    fn render_settings_appconfig(&self, cx: &mut Context<Self>) -> impl IntoElement {
+
+        div()
+            .flex_col()
+            .gap(px(8.))
+            .child(if self.config_dir_status.is_empty() {
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::text_faint())
+                    .child("配置目录可自定义（覆盖默认 ~/.<tool>；留空恢复默认）")
+                    .into_any_element()
+            } else {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(if self.config_dir_status.contains("失败") {
+                        theme::DANGER
+                    } else {
+                        theme::ACCENT
+                    }))
+                    .child(self.config_dir_status.clone())
+                    .into_any_element()
+            })
+            .children(Tool::ALL.iter().map(|&tool| {
+                let dir = self.tool_config_dir(tool)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let exists = self.tool_config_dir(tool)
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                div()
+                    .id(("appcfg-row", tool as usize))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.5))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.1))
+                    .child(
+                        div()
+                            .w(px(24.))
+                            .text_size(px(13.))
+                            .text_color(theme::accent())
+                            .child(tool.glyph()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme::text())
+                                    .child(tool.label()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(theme::MONO_FONT)
+                                    .text_size(px(10.))
+                                    .text_color(rgb(if exists {
+                                        theme::JADE
+                                    } else {
+                                        theme::TEXT_FAINT
+                                    }))
+                                    .child(if exists {
+                                        format!("{dir} · 已初始化")
+                                    } else {
+                                        format!("{dir} · 未初始化")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child({
+                                        // 配置目录覆盖输入（预填当前覆盖值，否则空）。
+                                        let key = tool.id_str().to_string();
+                                        let entity = self
+                                            .config_dir_inputs
+                                            .get(&key)
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                let cur = self
+                                                    .store
+                                                    .read()
+                                                    .ok()
+                                                    .and_then(|s| {
+                                                        s.config()
+                                                            .settings
+                                                            .config_dir_for(tool)
+                                                            .map(str::to_string)
+                                                    })
+                                                    .unwrap_or_default();
+                                                let e = cx.new(|cx| {
+                                                    crate::text_field::TextField::new(
+                                                        "自定义配置目录（留空=默认）",
+                                                        cx,
+                                                    )
+                                                });
+                                                e.update(cx, |f, _| f.set_text(&cur));
+                                                e
+                                            });
+                                        entity
+                                    })
+                                    .child(
+                                        widgets::ghost_button(
+                                            gpui::ElementId::from(("appcfg-save", tool as usize)),
+                                            "保存目录",
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.save_config_dir(tool, cx);
+                                        })),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(
+                                            gpui::ElementId::from(("appcfg-open", tool as usize)),
+                                            "打开配置目录",
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let dir = this.tool_config_dir(tool);
+                                            if let Some(dir) = dir {
+                                                #[cfg(target_os = "macos")]
+                                                let _ = std::process::Command::new("open").arg(&dir).spawn();
+                                                #[cfg(target_os = "linux")]
+                                                let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+                                                #[cfg(target_os = "windows")]
+                                                let _ = std::process::Command::new("cmd")
+                                                    .args(["/C", "start", "", &dir.display().to_string()])
+                                                    .spawn();
+                                                this.status = format!("已打开 {}", dir.display());
+                                                cx.notify();
+                                            }
+                                        })),
+                                    ),
+                            ),
+                    )
+            }))
+    }
+
+    /// 路由分区：监听地址/端口汇总 + 每工具故障转移设置。
+    fn render_settings_routing(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let routable = [Tool::Claude, Tool::Codex, Tool::Gemini, Tool::GrokBuild];
+        let config = self.store.read().expect("store lock").config().clone();
+        div()
+            .flex_col()
+            .gap(px(8.))
+            .children(routable.into_iter().enumerate().map(|(i, tool)| {
+                let rc = config.settings.routing_for(tool);
+                let running = self.routing.is_running(tool);
+                div()
+                    .id(("settings-route-row", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.5))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme::text())
+                                    .child(tool.label()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(if running {
+                                        theme::JADE
+                                    } else {
+                                        theme::TEXT_FAINT
+                                    }))
+                                    .child(if running {
+                                        format!(
+                                            "运行中 · {}:{} · 故障转移 {}",
+                                            rc.listen_addr,
+                                            rc.port,
+                                            if rc.failover { "开启" } else { "关闭" }
+                                        )
+                                    } else {
+                                        format!(
+                                            "未运行 · 监听 {}:{}",
+                                            rc.listen_addr, rc.port
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(widgets::pill(
+                        if rc.enabled { "路由中" } else { "直连" },
+                        if rc.enabled {
+                            theme::jade()
+                        } else {
+                            theme::text_dim()
+                        },
+                    ))
+            }))
+    }
+
+    /// 网络分区：连接状态概览 + 全局代理占位。
+    fn render_settings_network(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // 每工具路由连接状态（监听地址/端口/运行）。
+        let tools: Vec<Tool> = Tool::ALL
+            .iter()
+            .copied()
+            .filter(|t| t.supports_aggregation())
+            .collect();
+        div()
+            .flex_col()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.5))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .text_color(theme::text())
+                            .child("全局出站代理"),
+                    )
+                    .child(match self.store.read().ok().and_then(|s| s.config().settings.global_proxy().map(|p| p.to_string())) {
+                        Some(_) => widgets::pill("已配置", theme::jade()),
+                        None => widgets::pill("未配置", theme::text_dim()),
+                    }),
+            )
+            .child(div().w_full().child(self.global_proxy_url.clone()))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(
+                        widgets::ghost_button("proxy-save", "保存").on_click(
+                            cx.listener(|this, _, _, cx| this.save_global_proxy(cx)),
+                        ),
+                    )
+                    .child(
+                        widgets::ghost_button("proxy-test", "测试连接").on_click(
+                            cx.listener(|this, _, _, cx| this.test_global_proxy(cx)),
+                        ),
+                    )
+                    .child(
+                        widgets::ghost_button("proxy-scan", "扫描本地").on_click(
+                            cx.listener(|this, _, _, cx| this.scan_proxies(cx)),
+                        ),
+                    ),
+            )
+            .when(!self.proxy_scan.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .children(self.proxy_scan.iter().cloned().enumerate().map(|(i, (url, _proto, _port))| {
+                            div()
+                                .id(("proxy-scan-item", i))
+                                .cursor_pointer()
+                                .px(px(8.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .bg(theme::surface_a(0.35))
+                                .border_1()
+                                .border_color(theme::stroke_a(0.12))
+                                .text_size(px(11.))
+                                .text_color(theme::text_dim())
+                                .hover(|s| s.bg(theme::stroke_a(0.08)))
+                                .child(url.clone())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.global_proxy_url.update(cx, |f, _cx| f.set_text(&url));
+                                    cx.notify();
+                                }))
+                        }))
+                )
+            })
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::text_faint())
+                    .child("ns-switch 自身出站请求（用量/GitHub/models.dev/更新检查）经此代理；本地路由代理（127.0.0.1）不受影响。"),
+            )
+            .when(!self.proxy_status.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(match self.status_tone {
+                            StatusTone::Success => theme::jade(),
+                            StatusTone::Error => theme::danger(),
+                            StatusTone::Neutral => theme::text_dim(),
+                        })
+                        .child(self.proxy_status.clone()),
+                )
+            })
+            .when(
+                self.proxy_test.is_some(),
+                |el| el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_dim())
+                        .child(match &self.proxy_test {
+                            Some((true, ms, _)) => format!("✓ 经代理可达（{ms}ms）"),
+                            Some((false, _, Some(e))) => format!("✗ 不可达：{e}"),
+                            _ => String::new(),
+                        }),
+                ),
+            )
+            .child(
+                div()
+                    .mt(px(6.))
+                    .text_size(px(13.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("连接状态"),
+            )
+            .children(tools.into_iter().enumerate().map(|(i, tool)| {
+                let rc = self
+                    .store
+                    .read()
+                    .map(|s| s.config().settings.routing_for(tool))
+                    .unwrap_or_default();
+                let running = self.routing.is_running(tool);
+                let port_text = if running {
+                    self.routing
+                        .port_of(tool)
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| rc.port.to_string())
+                } else {
+                    rc.port.to_string()
+                };
+                div()
+                    .id(("settings-net-row", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.35))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.08))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "{} · 监听 {}:{}",
+                                tool.label(),
+                                rc.listen_addr,
+                                port_text
+                            )),
+                    )
+                    .child(if running {
+                        widgets::pill("运行中", theme::jade())
+                    } else {
+                        widgets::pill("未运行", theme::text_dim())
+                    })
+            }))
     }
 
     /// 渲染 M10 会话页：列表 / 搜索 / 分组 / 批量删除。
@@ -3306,22 +7123,68 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("会话管理"),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
-                                    .child(format!("{total} 个会话 · 按项目分组")),
+                                    .text_color(theme::text_faint())
+                                    .child(format!(
+                                        "{total} 个会话 · {} · 按项目分组",
+                                        match self.session_tool {
+                                            ns_sessions::SessionTool::Claude => "Claude Code",
+                                            ns_sessions::SessionTool::Codex => "Codex",
+                                            ns_sessions::SessionTool::Gemini => "Gemini CLI",
+                                            ns_sessions::SessionTool::OpenCode => "OpenCode",
+                                            ns_sessions::SessionTool::Pi => "Pi",
+                                            ns_sessions::SessionTool::Hermes => "Hermes",
+                                            ns_sessions::SessionTool::OpenClaw => "OpenClaw",
+                                        }
+                                    )),
                             ),
                     )
                     .child(
-                        widgets::ghost_button(("sessions-refresh", 0usize), "刷新").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.load_sessions(cx);
-                            }),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .children(
+                                [
+                                    (ns_sessions::SessionTool::Claude, "Claude"),
+                                    (ns_sessions::SessionTool::Codex, "Codex"),
+                                    (ns_sessions::SessionTool::Gemini, "Gemini"),
+                                    (ns_sessions::SessionTool::OpenCode, "OpenCode"),
+                                    (ns_sessions::SessionTool::Pi, "Pi"),
+                                    (ns_sessions::SessionTool::Hermes, "Hermes"),
+                                    (ns_sessions::SessionTool::OpenClaw, "OpenClaw"),
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (tool, label))| {
+                                    let selected = self.session_tool == tool;
+                                    let mut b = widgets::ghost_button(
+                                        gpui::ElementId::from(("session-tool", i)),
+                                        label,
+                                    );
+                                    if selected {
+                                        b = b
+                                            .bg(theme::accent_a(0.18))
+                                            .border_1()
+                                            .border_color(theme::accent_a(0.5));
+                                    }
+                                    b.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.session_tool = tool;
+                                        this.session_viewing = None;
+                                        this.load_sessions(cx);
+                                    }))
+                                }),
+                            )
+                            .child(widgets::ghost_button(("sessions-refresh", 0usize), "刷新").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.load_sessions(cx);
+                                }),
+                            )),
                     ),
             )
             .child(
@@ -3332,13 +7195,68 @@ impl SwitchApp {
             .child(if self.sessions_loading {
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(theme::TEXT_DIM))
+                    .text_color(theme::text_dim())
                     .child("加载会话中…")
             } else if grouped.is_empty() {
+                let icon = match self.session_tool {
+                    ns_sessions::SessionTool::Claude => "☰",
+                    ns_sessions::SessionTool::Codex => "⌬",
+                    ns_sessions::SessionTool::Gemini => "✦",
+                    ns_sessions::SessionTool::OpenCode => "⬡",
+                    ns_sessions::SessionTool::Pi => "π",
+                    ns_sessions::SessionTool::Hermes => "⚡",
+                    ns_sessions::SessionTool::OpenClaw => "❖",
+                };
+                let tool_name = match self.session_tool {
+                    ns_sessions::SessionTool::Claude => "Claude",
+                    ns_sessions::SessionTool::Codex => "Codex",
+                    ns_sessions::SessionTool::Gemini => "Gemini",
+                    ns_sessions::SessionTool::OpenCode => "OpenCode",
+                    ns_sessions::SessionTool::Pi => "Pi",
+                    ns_sessions::SessionTool::Hermes => "Hermes",
+                    ns_sessions::SessionTool::OpenClaw => "OpenClaw",
+                };
                 div()
-                    .text_size(px(12.))
-                    .text_color(rgb(theme::TEXT_FAINT))
-                    .child("未找到会话（点击“刷新”扫描 ~/.claude/projects）")
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(24.))
+                    .child(
+                        div()
+                            .size(px(48.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::accent_a(0.08))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.14))
+                            .text_size(px(20.))
+                            .text_color(theme::accent())
+                            .child(icon),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(format!("还没有 {} 的会话", tool_name)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(match tool_name {
+                                "Claude" => "点击「刷新」扫描 ~/.claude/projects 目录",
+                                "Codex" => "点击「刷新」扫描 ~/.codex/sessions 目录",
+                                "Gemini" => "点击「刷新」扫描 ~/.gemini/tmp/**/chats 目录",
+                                "OpenCode" => "点击「刷新」扫描 ~/.local/share/opencode 数据库",
+                                "Pi" => "点击「刷新」扫描 ~/.pi/agent/sessions 目录",
+                                "Hermes" => "点击「刷新」扫描 ~/.hermes/state.db 数据库",
+                                "OpenClaw" => "点击「刷新」调用 openclaw sessions 列出会话",
+                                _ => "点击「刷新」扫描工具会话目录",
+                            }),
+                    )
             } else {
                 div()
                     .flex_col()
@@ -3352,7 +7270,7 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(12.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
                                     .child(format!("{} · {} 个", project, sess.len())),
                             )
                             .children(sess.into_iter().enumerate().map(|(si, s)| {
@@ -3364,11 +7282,11 @@ impl SwitchApp {
                                     .gap(px(10.))
                                     .p(px(10.))
                                     .rounded(px(8.))
-                                    .bg(theme::alpha(theme::PANEL_SOLID, 0.5))
+                                    .bg(theme::panel_a(0.5))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.1))
+                                    .border_color(theme::stroke_a(0.1))
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(theme::alpha(theme::STROKE, 0.05)))
+                                    .hover(|style| style.bg(theme::stroke_a(0.05)))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_session_view(path.clone(), cx);
                                     }))
@@ -3380,17 +7298,25 @@ impl SwitchApp {
                                             .child(
                                                 div()
                                                     .text_size(px(13.))
-                                                    .text_color(rgb(theme::TEXT))
-                                                    .child(format!(
-                                                        "{} · {} 消息",
-                                                        s.id.chars().take(8).collect::<String>(),
-                                                        s.message_count
-                                                    )),
+                                                    .text_color(theme::text())
+                                                    .child(if s.title.is_empty() {
+                                                        format!(
+                                                            "{} · {} 消息",
+                                                            s.id.chars().take(8).collect::<String>(),
+                                                            s.message_count
+                                                        )
+                                                    } else {
+                                                        format!(
+                                                            "{} · {} 消息",
+                                                            s.title,
+                                                            s.message_count
+                                                        )
+                                                    }),
                                             )
                                             .child(
                                                 div()
                                                     .text_size(px(11.))
-                                                    .text_color(rgb(theme::TEXT_FAINT))
+                                                    .text_color(theme::text_faint())
                                                     .child(s.last_model.clone().unwrap_or_default()),
                                             ),
                                     )
@@ -3420,22 +7346,22 @@ impl SwitchApp {
                             .w(px(360.))
                             .p(px(16.))
                             .rounded(px(12.))
-                            .bg(theme::color(theme::PANEL_SOLID))
+                            .bg(theme::panel())
                             .border_1()
-                            .border_color(theme::alpha(theme::DANGER, 0.4))
+                            .border_color(theme::danger_a(0.4))
                             .flex_col()
                             .gap(px(12.))
                             .child(
                                 div()
                                     .text_size(px(14.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("删除会话？"),
                             )
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
                                     .child(format!(
                                         "该操作不可撤销：{}",
                                         std::path::Path::new(&path)
@@ -3503,20 +7429,20 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("本地路由"),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("每工具独立代理：live 配置指向 127.0.0.1，真实 key 留在 config.json"),
                             ),
                     )
                     .child(
                         widgets::pill(
                             format!("{} 个工具可路由", routable.len()),
-                            theme::color(theme::ACCENT),
+                            theme::accent(),
                         ),
                     ),
             )
@@ -3549,8 +7475,8 @@ impl SwitchApp {
                     .flex_col()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.12))
-                    .bg(theme::color(theme::BG_1).opacity(0.55))
+                    .border_color(theme::stroke_a(0.12))
+                    .bg(theme::bg_1().opacity(0.55))
                     .p(px(16.))
                     .gap(px(12.))
                     .child(
@@ -3566,14 +7492,14 @@ impl SwitchApp {
                                     .child(
                                         div()
                                             .text_size(px(14.))
-                                            .text_color(rgb(theme::ACCENT))
+                                            .text_color(theme::accent())
                                             .child(tool.glyph()),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(13.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(tool.label()),
                                     ),
                             )
@@ -3588,15 +7514,15 @@ impl SwitchApp {
                             .child(
                                 div()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .text_color(theme::text_dim())
                                     .child(provider_name),
                             )
                             .child(if running {
-                                widgets::status_dot(theme::color(theme::JADE), 7.)
+                                widgets::status_dot(theme::jade(), 7.)
                             } else {
-                                widgets::status_dot(theme::color(theme::TEXT_DIM), 7.)
+                                widgets::status_dot(theme::text_dim(), 7.)
                             })
-                            .child(div().text_size(px(11.)).text_color(rgb(theme::TEXT_FAINT)).child(
+                            .child(div().text_size(px(11.)).text_color(theme::text_faint()).child(
                                 if running {
                                     format!("代理运行中 · 127.0.0.1:{port_text}")
                                 } else {
@@ -3607,7 +7533,7 @@ impl SwitchApp {
                     .child(if !status.is_empty() {
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child(status)
                     } else {
                         div()
@@ -3628,9 +7554,9 @@ impl SwitchApp {
                                     .px(px(8.))
                                     .rounded(px(6.))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.16))
-                                    .bg(theme::alpha(0x261d12, 0.5))
-                                    .text_color(rgb(theme::TEXT))
+                                    .border_color(theme::stroke_a(0.16))
+                                    .bg(theme::surface_a(0.5))
+                                    .text_color(theme::text())
                                     .text_size(px(12.))
                                     .child(port_text),
                             )
@@ -3710,10 +7636,176 @@ impl SwitchApp {
                                 })),
                             ),
                     )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(widgets::section_label("熔断阈值"))
+                            .child(
+                                widgets::ghost_button(("breaker-th-down", i), "−").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        let mut store = this.store.write().expect("store lock");
+                                        let mut rc = store.config().settings.routing_for(tool);
+                                        rc.breaker_threshold = rc.breaker_threshold.saturating_sub(1).max(1);
+                                        let v = rc.breaker_threshold;
+                                        let r = store.set_routing(tool, rc);
+                                        this.status = match r {
+                                            Ok(()) => format!("{} 熔断阈值: {v}", tool.label()),
+                                            Err(e) => format!("保存失败: {e}"),
+                                        };
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(24.))
+                                    .text_size(px(12.))
+                                    .text_color(theme::text())
+                                    .child(rc.breaker_threshold.to_string()),
+                            )
+                            .child(
+                                widgets::ghost_button(("breaker-th-up", i), "+").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        let mut store = this.store.write().expect("store lock");
+                                        let mut rc = store.config().settings.routing_for(tool);
+                                        rc.breaker_threshold = (rc.breaker_threshold + 1).min(20);
+                                        let v = rc.breaker_threshold;
+                                        let r = store.set_routing(tool, rc);
+                                        this.status = match r {
+                                            Ok(()) => format!("{} 熔断阈值: {v}", tool.label()),
+                                            Err(e) => format!("保存失败: {e}"),
+                                        };
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(widgets::section_label("冷却(秒)"))
+                            .child(
+                                widgets::ghost_button(("breaker-cd-down", i), "−5").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        let mut store = this.store.write().expect("store lock");
+                                        let mut rc = store.config().settings.routing_for(tool);
+                                        rc.breaker_cooldown = rc.breaker_cooldown.saturating_sub(5).max(1);
+                                        let v = rc.breaker_cooldown;
+                                        let r = store.set_routing(tool, rc);
+                                        this.status = match r {
+                                            Ok(()) => format!("{} 冷却: {v}s", tool.label()),
+                                            Err(e) => format!("保存失败: {e}"),
+                                        };
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(40.))
+                                    .text_size(px(12.))
+                                    .text_color(theme::text())
+                                    .child(rc.breaker_cooldown.to_string()),
+                            )
+                            .child(
+                                widgets::ghost_button(("breaker-cd-up", i), "+5").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        let mut store = this.store.write().expect("store lock");
+                                        let mut rc = store.config().settings.routing_for(tool);
+                                        rc.breaker_cooldown = (rc.breaker_cooldown + 5).min(300);
+                                        let v = rc.breaker_cooldown;
+                                        let r = store.set_routing(tool, rc);
+                                        this.status = match r {
+                                            Ok(()) => format!("{} 冷却: {v}s", tool.label()),
+                                            Err(e) => format!("保存失败: {e}"),
+                                        };
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    )
             }))
+            .child(self.render_breaker_section(cx))
             .child(self.render_aggregation_section(cx))
+            .child(self.render_request_log_section(cx))
     }
 
+
+    /// 渲染熔断/故障转移状态分区（路由页内）。
+    fn render_breaker_section(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        const ROUTABLE: [Tool; 4] = [Tool::Claude, Tool::Codex, Tool::Gemini, Tool::GrokBuild];
+        div()
+            .id("breaker-section")
+            .flex_col()
+            .gap(px(12.))
+            .mt(px(8.))
+            .child(
+                div()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("熔断 / 故障转移状态"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("每工具各上游熔断器状态（未运行时无记录）"),
+                    ),
+            )
+            .children(ROUTABLE.into_iter().enumerate().map(|(i, tool)| {
+                let running = self.routing.is_running(tool);
+                let states = self.routing.breaker_states(tool);
+                div()
+                    .id(("breaker-row", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(theme::panel_a(0.35))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.08))
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(tool.label()),
+                    )
+                    .child(if !running {
+                        widgets::pill("未运行", theme::text_dim())
+                    } else if states.is_empty() {
+                        widgets::pill("无上游记录", theme::text_dim())
+                    } else {
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .children(states.into_iter().map(|(idx, st)| {
+                                let (label, color) = match st {
+                                    ns_proxy::CircuitState::Closed => {
+                                        ("关闭", theme::jade())
+                                    }
+                                    ns_proxy::CircuitState::Open => {
+                                        ("熔断", theme::danger())
+                                    }
+                                    ns_proxy::CircuitState::HalfOpen => {
+                                        ("半开", theme::cinnabar())
+                                    }
+                                };
+                                widgets::pill(&format!("上游{idx} {label}"), color)
+                            }))
+                    })
+            }))
+    }
     /// 渲染聚合模式分区（路由页内）。
     fn render_aggregation_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         const AGG_TOOLS: [Tool; 2] = [Tool::Claude, Tool::Codex];
@@ -3754,13 +7846,13 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("聚合模式"),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("多供应商模型合并、选默认、按模型路由"),
                             ),
                     )
@@ -3780,20 +7872,20 @@ impl SwitchApp {
                                     .rounded(px(8.))
                                     .cursor_pointer()
                                     .bg(if selected {
-                                        theme::alpha(theme::ACCENT, 0.18)
+                                        theme::accent_a(0.18)
                                     } else {
-                                        theme::alpha(0x261d12, 0.4)
+                                        theme::surface_a(0.4)
                                     })
                                     .border_1()
                                     .border_color(if selected {
-                                        theme::alpha(theme::ACCENT, 0.5)
+                                        theme::accent_a(0.5)
                                     } else {
-                                        theme::alpha(theme::STROKE, 0.1)
+                                        theme::stroke_a(0.1)
                                     })
                                     .text_color(if selected {
-                                        rgb(theme::ACCENT)
+                                        theme::accent()
                                     } else {
-                                        rgb(theme::TEXT_DIM)
+                                        theme::text_dim()
                                     })
                                     .text_size(px(12.))
                                     .child(t.label())
@@ -3810,8 +7902,8 @@ impl SwitchApp {
                     .flex_col()
                     .rounded(px(12.))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.12))
-                    .bg(theme::color(theme::BG_1).opacity(0.55))
+                    .border_color(theme::stroke_a(0.12))
+                    .bg(theme::bg_1().opacity(0.55))
                     .p(px(16.))
                     .gap(px(12.))
                     .child(
@@ -3828,13 +7920,13 @@ impl SwitchApp {
                                         div()
                                             .text_size(px(13.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(agg_tool.label()),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(rgb(theme::TEXT_FAINT))
+                                            .text_color(theme::text_faint())
                                             .child(if agg.enabled {
                                                 "聚合已启用"
                                             } else {
@@ -3881,9 +7973,9 @@ impl SwitchApp {
                                             ))
                                             .border_1()
                                             .border_color(if is_default {
-                                                theme::alpha(theme::ACCENT, 0.5)
+                                                theme::accent_a(0.5)
                                             } else {
-                                                theme::alpha(theme::STROKE, 0.1)
+                                                theme::stroke_a(0.1)
                                             })
                                             .on_click({
                                                 let pid = pid.clone();
@@ -3940,11 +8032,134 @@ impl SwitchApp {
                     } else {
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::TEXT_FAINT))
+                            .text_color(theme::text_faint())
                             .child("启用后可将多个供应商加入聚合，并选一个默认。")
                             .into_any_element()
                     }),
             )
+    }
+
+    /// 渲染请求日志分区（路由页内）。
+    fn render_request_log_section(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self.routing.request_log.snapshot();
+        let (total, ok) = entries
+            .iter()
+            .fold((0usize, 0usize), |(t, o), e| (t + 1, o + usize::from(e.ok)));
+        div()
+            .id("request-log-section")
+            .flex_col()
+            .gap(px(12.))
+            .mt(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(theme::text())
+                                    .child("请求日志"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_faint())
+                                    .child("代理转发的最近请求（工具 / 请求模型 / 实际模型 / 状态 / 耗时）"),
+                            ),
+                    )
+                    .child(widgets::pill(format!("{total} 条 · {ok} 成功"), theme::accent())),
+            )
+            .child(if entries.is_empty() {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(120.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_faint())
+                            .child("暂无请求。启用路由并发出请求后，这里会显示转发记录。"),
+                    )
+            } else {
+                div()
+                    .flex_col()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme::stroke_a(0.12))
+                    .bg(theme::bg_1().opacity(0.55))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .bg(theme::bg_2().opacity(0.6))
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(div().w(px(90.)).child("工具"))
+                            .child(div().flex_1().child("请求模型 → 实际模型"))
+                            .child(div().w(px(70.)).child("状态"))
+                            .child(div().w(px(70.)).child("耗时")),
+                    )
+                    .children(entries.iter().take(200).enumerate().map(|(i, e)| {
+                        let tool_label = ns_presets::Tool::ALL
+                            .iter()
+                            .find(|t| t.id_str() == e.tool)
+                            .map(|t| t.label().to_string())
+                            .unwrap_or_else(|| e.tool.clone());
+                        div()
+                            .id(("reqlog-row", i))
+                            .flex()
+                            .items_center()
+                            .px(px(12.))
+                            .py(px(6.))
+                            .border_b_1()
+                            .border_color(theme::stroke_a(0.06))
+                            .text_size(px(11.))
+                            .child(div().w(px(90.)).text_color(theme::text_dim()).child(tool_label))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(theme::text_dim())
+                                    .child(format!(
+                                        "{} → {}",
+                                        if e.requested_model.is_empty() {
+                                            "-"
+                                        } else {
+                                            &e.requested_model
+                                        },
+                                        if e.actual_model.is_empty() {
+                                            "-"
+                                        } else {
+                                            &e.actual_model
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .w(px(70.))
+                                    .text_color(if e.ok {
+                                        theme::jade()
+                                    } else {
+                                        theme::danger()
+                                    })
+                                    .child(e.status.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(70.))
+                                    .text_color(theme::text_faint())
+                                    .child(format!("{}ms", e.elapsed_ms)),
+                            )
+                    }))
+            })
     }
 
     /// 切换某工具聚合开关。启用时若无供应商，自动加入该工具当前/首个供应商。
@@ -4066,7 +8281,19 @@ impl SwitchApp {
 
     /// 渲染 M7 统一 MCP 面板。
     fn render_mcp_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        const MCP_TOOLS: [Tool; 3] = [Tool::Claude, Tool::Codex, Tool::Gemini];
+        const MCP_TOOLS: [Tool; 11] = [
+            Tool::Claude,
+            Tool::Codex,
+            Tool::Gemini,
+            Tool::Opencode,
+            Tool::GrokBuild,
+            Tool::Kimi,
+            Tool::Openclaw,
+            Tool::Hermes,
+            Tool::Pi,
+            Tool::Mcode,
+            Tool::Omp,
+        ];
         let tool = self.mcp.tool;
         let servers = self.mcp.servers.clone();
         let status = self.mcp.status.clone();
@@ -4095,13 +8322,13 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("统一 MCP 面板"),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("一处管理各工具的 MCP 服务器，可跨工具同步"),
                             ),
                     )
@@ -4115,6 +8342,37 @@ impl SwitchApp {
                                     this.mcp.load(cx);
                                 }),
                             ))
+                            .child(
+                                widgets::ghost_button(("mcp-import", 0usize), "从其他工具导入").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        // 导入来源：取另一个支持 MCP 的工具（首个与当前不同者）。
+                                        let source = MCP_TOOLS
+                                            .iter()
+                                            .copied()
+                                            .find(|&t| t != this.mcp.tool)
+                                            .unwrap_or(this.mcp.tool);
+                                        this.mcp.import_from(source, cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::ghost_button(("mcp-scope", 0usize), "项目作用域")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mcp.open_scope(cx);
+                                    })),
+                            )
+                            .child(
+                                widgets::ghost_button(("mcp-enable-all", 0usize), "全部启用")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mcp.set_all_enabled(true, cx);
+                                    })),
+                            )
+                            .child(
+                                widgets::ghost_button(("mcp-disable-all", 0usize), "全部禁用")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mcp.set_all_enabled(false, cx);
+                                    })),
+                            )
                             .child(
                                 widgets::primary_button(("mcp-add", 0usize), "添加服务器").on_click(
                                     cx.listener(|this, _, _, cx| {
@@ -4140,20 +8398,20 @@ impl SwitchApp {
                             .rounded(px(8.))
                             .cursor_pointer()
                             .bg(if selected {
-                                theme::alpha(theme::ACCENT, 0.18)
+                                theme::accent_a(0.18)
                             } else {
-                                theme::alpha(0x261d12, 0.4)
+                                theme::surface_a(0.4)
                             })
                             .border_1()
                             .border_color(if selected {
-                                theme::alpha(theme::ACCENT, 0.5)
+                                theme::accent_a(0.5)
                             } else {
-                                theme::alpha(theme::STROKE, 0.1)
+                                theme::stroke_a(0.1)
                             })
                             .text_color(if selected {
-                                rgb(theme::ACCENT)
+                                theme::accent()
                             } else {
-                                rgb(theme::TEXT_DIM)
+                                theme::text_dim()
                             })
                             .text_size(px(12.))
                             .child(t.label())
@@ -4165,7 +8423,7 @@ impl SwitchApp {
             .child(if !status.is_empty() {
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::CINNABAR))
+                    .text_color(theme::cinnabar())
                     .child(status)
             } else {
                 div()
@@ -4173,22 +8431,43 @@ impl SwitchApp {
             .child(if !write_msg.is_empty() {
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::JADE))
+                    .text_color(theme::jade())
                     .child(write_msg)
             } else {
                 div()
             })
             .child(if servers.is_empty() {
                 div()
-                    .flex()
+                    .flex_col()
                     .items_center()
-                    .justify_center()
-                    .h(px(160.))
+                    .gap(px(10.))
+                    .p(px(24.))
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("该工具暂无 MCP 服务器，点击“添加服务器”"),
+                            .size(px(48.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::accent_a(0.08))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.14))
+                            .text_size(px(20.))
+                            .text_color(theme::accent())
+                            .child("⛁"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(format!("{} 暂无 MCP 服务器", tool.label())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("点击右上角「添加服务器」配置 MCP 连接"),
                     )
             } else {
                 div()
@@ -4205,8 +8484,8 @@ impl SwitchApp {
                             .gap(px(12.))
                             .rounded(px(10.))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.12))
-                            .bg(theme::color(theme::BG_1).opacity(0.55))
+                            .border_color(theme::stroke_a(0.12))
+                            .bg(theme::bg_1().opacity(0.55))
                             .px(px(14.))
                             .h(px(52.))
                             .child(
@@ -4218,17 +8497,17 @@ impl SwitchApp {
                                         div()
                                             .text_size(px(13.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(s.name.clone()),
                                     )
                                     .child(widgets::pill(
                                         transport_label(s.transport),
-                                        theme::color(theme::ACCENT),
+                                        theme::accent(),
                                     ))
                                     .child(if s.enabled {
-                                        widgets::pill("启用", theme::color(theme::JADE))
+                                        widgets::pill("启用", theme::jade())
                                     } else {
-                                        widgets::pill("停用", theme::color(theme::TEXT_DIM))
+                                        widgets::pill("停用", theme::text_dim())
                                     }),
                             )
                             .child(
@@ -4285,6 +8564,11 @@ impl SwitchApp {
             } else {
                 div().into_any_element()
             })
+            .child(if self.mcp.scope_open {
+                self.render_mcp_scope_dialog(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(if let Some(name) = confirm_delete {
                 self.render_mcp_confirm_delete(&name, cx).into_any_element()
             } else {
@@ -4318,14 +8602,14 @@ impl SwitchApp {
                     .gap(px(12.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.2))
+                    .border_color(theme::stroke_a(0.2))
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(if is_edit { "编辑 MCP 服务器" } else { "添加 MCP 服务器" }),
                     )
                     .child(
@@ -4333,7 +8617,9 @@ impl SwitchApp {
                             .flex()
                             .gap(px(6.))
                             .child(self.mcp_transport_pill(McpTransport::Stdio, cx))
-                            .child(self.mcp_transport_pill(McpTransport::Http, cx)),
+                            .child(self.mcp_transport_pill(McpTransport::Http, cx))
+                            .child(self.mcp_transport_pill(McpTransport::Sse, cx))
+                            .child(self.mcp_transport_pill(McpTransport::Ws, cx)),
                     )
                     .child(self.mcp_field("服务器名", name))
                     .child(if is_http {
@@ -4346,6 +8632,20 @@ impl SwitchApp {
                             .child(self.mcp_field("参数（空格分隔）", args))
                             .into_any_element()
                     })
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(widgets::section_label("环境变量（每行 key=value）"))
+                            .child(self.mcp_field("", form.env_raw.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(widgets::section_label("请求头（每行 key: value，仅远程传输有效）"))
+                            .child(self.mcp_field("", form.headers_raw.clone())),
+                    )
                     .child(
                         div()
                             .flex()
@@ -4361,9 +8661,9 @@ impl SwitchApp {
                                         cx.notify();
                                     }))
                                     .child(if self.mcp.form.enabled {
-                                        widgets::pill("启用", theme::color(theme::JADE))
+                                        widgets::pill("启用", theme::jade())
                                     } else {
-                                        widgets::pill("停用", theme::color(theme::TEXT_DIM))
+                                        widgets::pill("停用", theme::text_dim())
                                     }),
                             ),
                     )
@@ -4391,6 +8691,85 @@ impl SwitchApp {
             )
     }
 
+    /// MCP 项目作用域对话框（选择项目目录，读取 `.mcp.json`）。
+    fn render_mcp_scope_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let path_input = self.mcp.scope_path.clone();
+        let result = self.mcp.scope_result.clone();
+        div()
+            .id("mcp-scope-dialog")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x000000, 0.55))
+            .child(
+                div()
+                    .w(px(480.))
+                    .rounded(px(12.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.25))
+                    .shadow_lg()
+                    .p(px(20.))
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("项目作用域 MCP"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_dim())
+                            .child("输入项目目录路径，读取该项目的 `.mcp.json` 项目作用域 MCP 服务器。"),
+                    )
+                    .child(path_input)
+                    .child(
+                        div()
+                            .min_h(px(32.))
+                            .text_size(px(11.5))
+                            .text_color(theme::text_dim())
+                            .child(if result.is_empty() {
+                                "尚未读取".to_string()
+                            } else {
+                                result
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("mcp-scope-choose", "选择目录").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.choose_scope_dir(cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::ghost_button("mcp-scope-cancel", "关闭").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.scope_open = false;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button("mcp-scope-read", "读取").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.read_scope(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
     /// MCP 传输类型选择药丸。
     fn mcp_transport_pill(&self, transport: McpTransport, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.mcp.form.transport == transport;
@@ -4409,20 +8788,20 @@ impl SwitchApp {
             .rounded(px(8.))
             .cursor_pointer()
             .bg(if selected {
-                theme::alpha(theme::ACCENT, 0.18)
+                theme::accent_a(0.18)
             } else {
-                theme::alpha(0x261d12, 0.4)
+                theme::surface_a(0.4)
             })
             .border_1()
             .border_color(if selected {
-                theme::alpha(theme::ACCENT, 0.5)
+                theme::accent_a(0.5)
             } else {
-                theme::alpha(theme::STROKE, 0.1)
+                theme::stroke_a(0.1)
             })
             .text_color(if selected {
-                rgb(theme::ACCENT)
+                theme::accent()
             } else {
-                rgb(theme::TEXT_DIM)
+                theme::text_dim()
             })
             .text_size(px(12.))
             .child(label)
@@ -4444,8 +8823,8 @@ impl SwitchApp {
                     .px(px(8.))
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.16))
-                    .bg(theme::alpha(0x261d12, 0.5))
+                    .border_color(theme::stroke_a(0.16))
+                    .bg(theme::surface_a(0.5))
                     .child(field),
             )
     }
@@ -4469,20 +8848,20 @@ impl SwitchApp {
                     .gap(px(14.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::DANGER, 0.4))
+                    .border_color(theme::danger_a(0.4))
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("删除 MCP 服务器"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child(format!("确认删除服务器 “{name}”？此操作将从 {} 配置移除。", self.mcp.tool.label())),
                     )
                     .child(
@@ -4540,13 +8919,13 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("统一 Skills 面板"),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("一处管理各工具的 Skills，可跨工具同步"),
                             ),
                     )
@@ -4557,13 +8936,42 @@ impl SwitchApp {
                             .gap(px(8.))
                             .child(widgets::ghost_button(("skills-refresh", 0usize), "刷新").on_click(
                                 cx.listener(|this, _, _, cx| {
+                                    this.skills.shared = this
+                                        .store
+                                        .read()
+                                        .map(|s| s.config().settings.shared_skills)
+                                        .unwrap_or(false);
                                     this.skills.load(cx);
                                 }),
                             ))
                             .child(
+                                widgets::ghost_button(("skills-check-updates", 0usize), "检查更新")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.check_updates(cx);
+                                    })),
+                            )
+                            .child(
+                                widgets::ghost_button(("skills-update-all", 0usize), "全部更新")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.update_all(cx);
+                                    })),
+                            )
+                            .child(
                                 widgets::ghost_button(("skills-install", 0usize), "安装")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.skills.open_install(cx);
+                                    })),
+                            )
+                            .child(
+                                widgets::ghost_button(("skills-enable-all", 0usize), "全部启用")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.set_all_enabled(true, cx);
+                                    })),
+                            )
+                            .child(
+                                widgets::ghost_button(("skills-disable-all", 0usize), "全部禁用")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.set_all_enabled(false, cx);
                                     })),
                             )
                             .child(
@@ -4591,20 +8999,20 @@ impl SwitchApp {
                             .rounded(px(8.))
                             .cursor_pointer()
                             .bg(if selected {
-                                theme::alpha(theme::ACCENT, 0.18)
+                                theme::accent_a(0.18)
                             } else {
-                                theme::alpha(0x261d12, 0.4)
+                                theme::surface_a(0.4)
                             })
                             .border_1()
                             .border_color(if selected {
-                                theme::alpha(theme::ACCENT, 0.5)
+                                theme::accent_a(0.5)
                             } else {
-                                theme::alpha(theme::STROKE, 0.1)
+                                theme::stroke_a(0.1)
                             })
                             .text_color(if selected {
-                                rgb(theme::ACCENT)
+                                theme::accent()
                             } else {
-                                rgb(theme::TEXT_DIM)
+                                theme::text_dim()
                             })
                             .text_size(px(12.))
                             .child(t.label())
@@ -4613,10 +9021,77 @@ impl SwitchApp {
                             }))
                     })),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .children(
+                        [
+                            (crate::skills::SkillsView::Installed, "已安装"),
+                            (crate::skills::SkillsView::Discover, "发现"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (view, label))| {
+                            let selected = self.skills.view == view;
+                            widgets::ghost_button(
+                                gpui::ElementId::from(("skills-view", i)),
+                                label,
+                            )
+                            .when(selected, |b| {
+                                b.bg(theme::accent_a(0.18))
+                                    .border_1()
+                                    .border_color(theme::accent_a(0.5))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.skills.view = view;
+                                cx.notify();
+                            }))
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("同步策略"),
+                    )
+                    .children(
+                        [
+                            (ns_skills::model::SyncStrategy::Auto, "自动"),
+                            (ns_skills::model::SyncStrategy::Symlink, "符号链接"),
+                            (ns_skills::model::SyncStrategy::Copy, "复制"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (strat, label))| {
+                            let cur = self.skills.strategy;
+                            widgets::ghost_button(
+                                gpui::ElementId::from(("skills-strategy", i)),
+                                label,
+                            )
+                            .when(strat == cur, |b| {
+                                b.bg(theme::accent_a(0.18))
+                                    .border_1()
+                                    .border_color(theme::accent_a(0.5))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.skills.strategy = strat;
+                                cx.notify();
+                            }))
+                        }),
+                    ),
+            )
             .child(if !status.is_empty() {
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::CINNABAR))
+                    .text_color(theme::cinnabar())
                     .child(status)
             } else {
                 div()
@@ -4624,22 +9099,143 @@ impl SwitchApp {
             .child(if !write_msg.is_empty() {
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::JADE))
+                    .text_color(theme::jade())
                     .child(write_msg)
             } else {
                 div()
             })
-            .child(if skills.is_empty() {
+            .child(if self.skills.view == crate::skills::SkillsView::Discover {
+                let q = self.skills.discover_query.clone();
+                let status = self.skills.discover_status.clone();
+                let results = self.skills.discover_results.clone();
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h(px(160.))
+                    .flex_col()
+                    .gap(px(10.))
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("该工具暂无 Skills，点击“添加技能”"),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(q.clone()),
+                            )
+                            .child(
+                                widgets::ghost_button("skills-discover-search", "搜索").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.skills.search_discover(cx);
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(if !status.is_empty() {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(status)
+                    } else {
+                        div()
+                    })
+                    .children(results.into_iter().enumerate().map(|(i, (name, desc))| {
+                        let repo_url = format!("https://github.com/{name}");
+                        div()
+                            .id(("discover-row", i))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .p(px(10.))
+                            .rounded(px(8.))
+                            .bg(theme::panel_a(0.35))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.08))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .text_color(theme::text())
+                                            .child(name),
+                                    )
+                                    .child(if desc.is_empty() {
+                                        div()
+                                    } else {
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(theme::text_faint())
+                                            .child(desc)
+                                    }),
+                            )
+                            .child(
+                                widgets::ghost_button(
+                                    ("discover-install", i),
+                                    "从 GitHub 安装",
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let targets = [
+                                        ns_presets::Tool::Claude,
+                                        ns_presets::Tool::Codex,
+                                        ns_presets::Tool::Gemini,
+                                    ];
+                                    let paths = {
+                                        let mut p = ns_skills::model::SkillPaths::from_env();
+                                        p.shared = this.skills.shared;
+                                        p
+                                    };
+                                    match ns_skills::manager::install_from_github(
+                                        &repo_url,
+                                        "",
+                                        &paths,
+                                        &targets,
+                                    ) {
+                                        Ok(name) => {
+                                            this.skills.write_msg =
+                                                format!("已安装技能 {name}");
+                                            this.skills.load(cx);
+                                        }
+                                        Err(e) => {
+                                            this.skills.write_msg =
+                                                format!("安装失败: {e}")
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                            )
+                    }))
+            } else if skills.is_empty() {
+                div()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(24.))
+                    .child(
+                        div()
+                            .size(px(48.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::accent_a(0.08))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.14))
+                            .text_size(px(20.))
+                            .text_color(theme::accent())
+                            .child("✦"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(format!("{} 暂无已安装技能", self.skills.tool.label())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("点击「添加技能」安装新的 Skill 或切换到「发现」标签浏览"),
                     )
             } else {
                 div()
@@ -4656,8 +9252,8 @@ impl SwitchApp {
                             .gap(px(12.))
                             .rounded(px(10.))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.12))
-                            .bg(theme::color(theme::BG_1).opacity(0.55))
+                            .border_color(theme::stroke_a(0.12))
+                            .bg(theme::bg_1().opacity(0.55))
                             .px(px(14.))
                             .h(px(52.))
                             .child(
@@ -4667,15 +9263,26 @@ impl SwitchApp {
                                     .gap(px(10.))
                                     .child(
                                         div()
-                                            .text_size(px(13.))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme::TEXT))
-                                            .child(s.name.clone()),
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(theme::text())
+                                                    .child(s.name.clone()),
+                                            )
+                                            .child(if !s.enabled {
+                                                widgets::pill("已禁用", theme::cinnabar())
+                                            } else {
+                                                div()
+                                            }),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(rgb(theme::TEXT_FAINT))
+                                            .text_color(theme::text_faint())
                                             .child(if s.description.is_empty() {
                                                 "—".to_string()
                                             } else {
@@ -4688,6 +9295,18 @@ impl SwitchApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.))
+                                    .child(
+                                        widgets::ghost_button(
+                                            ("skill-toggle", i),
+                                            if s.enabled { "禁用" } else { "启用" },
+                                        )
+                                        .on_click({
+                                            let sn = sname.clone();
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.skills.toggle_enabled(&sn, cx);
+                                            })
+                                        }),
+                                    )
                                     .child(
                                         widgets::ghost_button(("skill-sync", i), "同步").on_click({
                                             let sn = sname.clone();
@@ -4729,6 +9348,11 @@ impl SwitchApp {
             } else {
                 div().into_any_element()
             })
+            .child(if self.skills.confirm_close {
+                self.render_skill_confirm_close(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(if let Some(name) = confirm_delete {
                 self.render_skill_confirm_delete(&name, cx).into_any_element()
             } else {
@@ -4760,18 +9384,19 @@ impl SwitchApp {
                     .gap(px(12.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.2))
+                    .border_color(theme::stroke_a(0.2))
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(if is_edit { "编辑 Skill" } else { "添加 Skill" }),
                     )
                     .child(self.skill_field("技能名", name))
                     .child(self.skill_field("描述", description))
+                    .child(self.skill_field("允许工具（逗号分隔）", form.allowed_tools.clone()))
                     .child(
                         div()
                             .flex_col()
@@ -4783,9 +9408,29 @@ impl SwitchApp {
                                     .px(px(8.))
                                     .rounded(px(8.))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.16))
-                                    .bg(theme::alpha(0x261d12, 0.5))
+                                    .border_color(theme::stroke_a(0.16))
+                                    .bg(theme::surface_a(0.5))
                                     .child(body),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(widgets::section_label("启用"))
+                            .child(
+                                div()
+                                    .id("skill-form-enabled")
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.toggle_form_enabled(cx);
+                                    }))
+                                    .child(if self.skills.form.enabled {
+                                        widgets::pill("启用", theme::jade())
+                                    } else {
+                                        widgets::pill("禁用", theme::cinnabar())
+                                    }),
                             ),
                     )
                     .child(
@@ -4796,8 +9441,7 @@ impl SwitchApp {
                             .child(
                                 widgets::ghost_button(("skill-cancel", 0usize), "取消").on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.skills.dialog_open = false;
-                                        cx.notify();
+                                        this.skills.request_close(cx);
                                     }),
                                 ),
                             )
@@ -4831,23 +9475,67 @@ impl SwitchApp {
                     .gap(px(12.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.2))
+                    .border_color(theme::stroke_a(0.2))
                     .child(
                         div()
-                            .text_size(px(14.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child("从 GitHub 安装 Skill"),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .children(
+                                [
+                                    (
+                                        crate::skills::SkillInstallSource::Github,
+                                        "GitHub 仓库",
+                                    ),
+                                    (
+                                        crate::skills::SkillInstallSource::LocalDir,
+                                        "本地目录",
+                                    ),
+                                ]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (src, label))| {
+                                    let selected = self.skills.install_source == src;
+                                    widgets::ghost_button(
+                                        gpui::ElementId::from(("skill-install-src", i)),
+                                        label,
+                                    )
+                                    .when(selected, |b| {
+                                        b.bg(theme::accent_a(0.18))
+                                            .border_1()
+                                            .border_color(theme::accent_a(0.5))
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.skills.install_source = src;
+                                        cx.notify();
+                                    }))
+                                }))
                     )
+                    .child(if self.skills.install_source
+                        == crate::skills::SkillInstallSource::Github
+                    {
+                        self.skill_field("仓库 URL", url).into_any_element()
+                    } else {
+                        self.skill_field(
+                            "本地目录",
+                            self.skills.install_local_dir.clone(),
+                        )
+                        .into_any_element()
+                    })
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("仓库需含 skills/<name>/SKILL.md（或仓库根 SKILL.md）"),
+                            .text_color(theme::text_faint())
+                            .child(if self.skills.install_source
+                                == crate::skills::SkillInstallSource::Github
+                            {
+                                "仓库需含 skills/<name>/SKILL.md（或仓库根 SKILL.md）"
+                            } else {
+                                "目录需含 SKILL.md（或 <name>.md）"
+                            }),
                     )
-                    .child(self.skill_field("仓库 URL", url))
                     .child(
                         div()
                             .flex()
@@ -4863,7 +9551,14 @@ impl SwitchApp {
                             .child(
                                 widgets::primary_button(("skill-install-go", 0usize), "安装")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.skills.install_github(cx);
+                                        match this.skills.install_source {
+                                            crate::skills::SkillInstallSource::Github => {
+                                                this.skills.install_github(cx)
+                                            }
+                                            crate::skills::SkillInstallSource::LocalDir => {
+                                                this.skills.install_local(cx)
+                                            }
+                                        }
                                     })),
                             ),
                     ),
@@ -4886,8 +9581,8 @@ impl SwitchApp {
                     .px(px(8.))
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.16))
-                    .bg(theme::alpha(0x261d12, 0.5))
+                    .border_color(theme::stroke_a(0.16))
+                    .bg(theme::surface_a(0.5))
                     .child(field),
             )
     }
@@ -4911,20 +9606,20 @@ impl SwitchApp {
                     .gap(px(14.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::DANGER, 0.4))
+                    .border_color(theme::danger_a(0.4))
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("删除 Skill"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child(format!(
                                 "确认删除技能 “{name}”？此操作将从 {} 移除。",
                                 self.skills.tool.label()
@@ -4952,13 +9647,72 @@ impl SwitchApp {
             )
     }
 
+    /// Skills 表单未保存更改确认浮层（继续编辑 / 放弃更改）。
+    fn render_skill_confirm_close(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("skill-close-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.55))
+            .child(
+                div()
+                    .id("skill-close")
+                    .w(px(380.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(20.))
+                    .rounded(px(14.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("未保存的更改"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_dim())
+                            .child("此技能有未保存的更改。确定要放弃吗？"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button(("skill-close-continue", 0usize), "继续编辑")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.confirm_close = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                widgets::danger_button(("skill-close-discard", 0usize), "放弃更改")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.skills.confirm_close = false;
+                                        this.skills.dialog_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     /// 渲染 M7 统一 Prompts 面板。
     fn render_prompts_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        const PROMPT_TOOLS: [Tool; 4] = [
+        const PROMPT_TOOLS: [Tool; 5] = [
             Tool::Claude,
             Tool::ClaudeDesktop,
             Tool::Codex,
             Tool::Gemini,
+            Tool::Pi,
         ];
         let tool = self.prompts.tool;
         let entries = self.prompts.entries.clone();
@@ -4988,13 +9742,13 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(16.))
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child("统一提示词面板"),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child("管理各工具提示词，写回提示文件（先回存既有内容）"),
                             ),
                     )
@@ -5039,20 +9793,20 @@ impl SwitchApp {
                             .rounded(px(8.))
                             .cursor_pointer()
                             .bg(if selected {
-                                theme::alpha(theme::ACCENT, 0.18)
+                                theme::accent_a(0.18)
                             } else {
-                                theme::alpha(0x261d12, 0.4)
+                                theme::surface_a(0.4)
                             })
                             .border_1()
                             .border_color(if selected {
-                                theme::alpha(theme::ACCENT, 0.5)
+                                theme::accent_a(0.5)
                             } else {
-                                theme::alpha(theme::STROKE, 0.1)
+                                theme::stroke_a(0.1)
                             })
                             .text_color(if selected {
-                                rgb(theme::ACCENT)
+                                theme::accent()
                             } else {
-                                rgb(theme::TEXT_DIM)
+                                theme::text_dim()
                             })
                             .text_size(px(12.))
                             .child(t.label())
@@ -5064,7 +9818,7 @@ impl SwitchApp {
             .child(if !status.is_empty() {
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::CINNABAR))
+                    .text_color(theme::cinnabar())
                     .child(status)
             } else {
                 div()
@@ -5072,22 +9826,45 @@ impl SwitchApp {
             .child(if !write_msg.is_empty() {
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::JADE))
+                    .text_color(theme::jade())
                     .child(write_msg)
             } else {
                 div()
             })
             .child(if entries.is_empty() {
                 div()
+                    .flex_1()
                     .flex()
+                    .flex_col()
                     .items_center()
                     .justify_center()
-                    .h(px(160.))
+                    .gap(px(10.))
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("该工具暂无提示词条目，点击“添加条目”"),
+                            .size(px(48.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme::accent_a(0.08))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.14))
+                            .text_size(px(20.))
+                            .text_color(theme::accent())
+                            .child("✎"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(format!("{} 暂无提示词条目", tool.label())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("点击右上角「添加条目」新建提示词，写回时合并到工具提示文件"),
                     )
             } else {
                 div()
@@ -5104,8 +9881,8 @@ impl SwitchApp {
                             .gap(px(12.))
                             .rounded(px(10.))
                             .border_1()
-                            .border_color(theme::alpha(theme::STROKE, 0.12))
-                            .bg(theme::color(theme::BG_1).opacity(0.55))
+                            .border_color(theme::stroke_a(0.12))
+                            .bg(theme::bg_1().opacity(0.55))
                             .px(px(14.))
                             .h(px(52.))
                             .child(
@@ -5117,13 +9894,13 @@ impl SwitchApp {
                                         div()
                                             .text_size(px(13.))
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme::TEXT))
+                                            .text_color(theme::text())
                                             .child(e.name.clone()),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(rgb(theme::TEXT_FAINT))
+                                            .text_color(theme::text_faint())
                                             .child(if e.body.lines().count() > 1 {
                                                 format!("{} 行", e.body.lines().count())
                                             } else {
@@ -5147,9 +9924,9 @@ impl SwitchApp {
                                                 })
                                             })
                                             .child(if e.enabled {
-                                                widgets::pill("启用", theme::color(theme::JADE))
+                                                widgets::pill("启用", theme::jade())
                                             } else {
-                                                widgets::pill("停用", theme::color(theme::TEXT_DIM))
+                                                widgets::pill("停用", theme::text_dim())
                                             }),
                                     )
                                     .child(
@@ -5180,6 +9957,11 @@ impl SwitchApp {
             } else {
                 div().into_any_element()
             })
+            .child(if self.prompts.confirm_close {
+                self.render_prompt_confirm_close(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
     }
 
     /// Prompts 新增/编辑对话框。
@@ -5207,14 +9989,14 @@ impl SwitchApp {
                     .gap(px(12.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.2))
+                    .border_color(theme::stroke_a(0.2))
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(if is_edit { "编辑提示词条目" } else { "添加提示词条目" }),
                     )
                     .child(self.skill_field("条目名", name))
@@ -5228,8 +10010,8 @@ impl SwitchApp {
                                     .px(px(8.))
                                     .rounded(px(8.))
                                     .border_1()
-                                    .border_color(theme::alpha(theme::STROKE, 0.16))
-                                    .bg(theme::alpha(0x261d12, 0.5))
+                                    .border_color(theme::stroke_a(0.16))
+                                    .bg(theme::surface_a(0.5))
                                     .child(body),
                             ),
                     )
@@ -5250,9 +10032,9 @@ impl SwitchApp {
                                         cx.notify();
                                     }))
                                     .child(if form.enabled {
-                                        widgets::pill("启用", theme::color(theme::JADE))
+                                        widgets::pill("启用", theme::jade())
                                     } else {
-                                        widgets::pill("停用", theme::color(theme::TEXT_DIM))
+                                        widgets::pill("停用", theme::text_dim())
                                     }),
                             ),
                     )
@@ -5264,8 +10046,7 @@ impl SwitchApp {
                             .child(
                                 widgets::ghost_button(("prompt-cancel", 0usize), "取消").on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.prompts.dialog_open = false;
-                                        cx.notify();
+                                        this.prompts.request_close(cx);
                                     }),
                                 ),
                             )
@@ -5300,20 +10081,20 @@ impl SwitchApp {
                     .gap(px(14.))
                     .p(px(20.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::DANGER, 0.4))
+                    .border_color(theme::danger_a(0.4))
                     .child(
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("删除提示词条目"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .child(format!(
                                 "确认删除条目 “{name}”？此操作仅从库移除，不影响已写回的文件。"
                             )),
@@ -5340,6 +10121,64 @@ impl SwitchApp {
             )
     }
 
+    /// Prompts 未保存更改确认浮层（关闭对话框前）。
+    fn render_prompt_confirm_close(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("prompt-close-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.55))
+            .child(
+                div()
+                    .id("prompt-close")
+                    .w(px(380.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(20.))
+                    .rounded(px(14.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::danger_a(0.5))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("未保存的更改"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_dim())
+                            .child("此条目有未保存的更改。关闭将丢弃这些更改。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button(("prompt-close-back", 0usize), "继续编辑")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prompts.confirm_close = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                widgets::danger_button(("prompt-close-discard", 0usize), "丢弃并关闭")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.prompts.confirm_close = false;
+                                        this.prompts.dialog_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     /// 路由开关指示（启用/禁用徽章）。
     fn render_routing_switch(
         &self,
@@ -5348,9 +10187,9 @@ impl SwitchApp {
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if enabled {
-            widgets::pill("已启用", theme::color(theme::JADE))
+            widgets::pill("已启用", theme::jade())
         } else {
-            widgets::pill("未启用", theme::color(theme::TEXT_DIM))
+            widgets::pill("未启用", theme::text_dim())
         }
     }
 
@@ -5373,12 +10212,12 @@ impl SwitchApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.08))
+                    .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child("通用供应商"),
                     )
                     .child(
@@ -5389,7 +10228,7 @@ impl SwitchApp {
                             .child(
                                 div()
                                     .text_size(px(10.5))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child(format!("{} 个", universals.len())),
                             )
                             .child(
@@ -5433,7 +10272,7 @@ impl SwitchApp {
                                 .child(
                                     div()
                                         .text_size(px(12.))
-                                        .text_color(rgb(theme::TEXT_FAINT))
+                                        .text_color(theme::text_faint())
                                         .child("尚无通用供应商，点击右上角添加"),
                                 )
                                 .into_any_element(),
@@ -5461,9 +10300,9 @@ impl SwitchApp {
         div()
             .rounded(px(12.))
             .p(px(14.))
-            .bg(theme::color(theme::BG_1).opacity(0.72))
+            .bg(theme::bg_1().opacity(0.72))
             .border_1()
-            .border_color(theme::alpha(theme::STROKE, 0.12))
+            .border_color(theme::stroke_a(0.12))
             .flex()
             .items_center()
             .justify_between()
@@ -5476,12 +10315,12 @@ impl SwitchApp {
                         div()
                             .size(px(34.))
                             .rounded(px(9.))
-                            .bg(theme::alpha(theme::ACCENT, 0.14))
+                            .bg(theme::accent_a(0.14))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(15.))
-                            .text_color(rgb(theme::ACCENT))
+                            .text_color(theme::accent())
                             .child("◈"),
                     )
                     .child(
@@ -5492,13 +10331,13 @@ impl SwitchApp {
                                 div()
                                     .text_size(px(12.5))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(u.name.clone()),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .text_color(theme::text_faint())
                                     .child(format!("{} · {}", u.provider_type, u.base_url)),
                             ),
                     ),
@@ -5510,7 +10349,7 @@ impl SwitchApp {
                     .gap(px(8.))
                     .child(widgets::pill(
                         format!("{app_count}/3 应用"),
-                        theme::color(theme::JADE),
+                        theme::jade(),
                     ))
                     .child({
                         let edit_id = uid.clone();
@@ -5524,6 +10363,28 @@ impl SwitchApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let id = edit_id.clone();
                             this.open_universal_edit(&id, cx);
+                        }))
+                    })
+                    .child({
+                        let sync_id = uid.clone();
+                        widgets::ghost_button(
+                            gpui::ElementId::from(gpui::SharedString::from(format!(
+                                "uni-sync-{}",
+                                uid
+                            ))),
+                            "同步到应用",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = sync_id.clone();
+                            let result = {
+                                let mut store = this.store.write().expect("store lock");
+                                store.sync_universal_children(&id)
+                            };
+                            this.status = match result {
+                                Ok(()) => format!("已同步通用供应商子配置"),
+                                Err(e) => format!("同步失败: {e}"),
+                            };
+                            cx.notify();
                         }))
                     })
                     .child({
@@ -5617,34 +10478,153 @@ impl SwitchApp {
         cx.notify();
     }
 
-    /// 占位页（未实现里程碑）。
-    fn render_placeholder_page(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+
+    /// 渲染应用管理页：受管 CLI 工具应用清单（能力/当前供应商/配置路径）。
+    fn render_apps_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (providers, current) = {
+            let store = self.store.read().expect("store lock");
+            let cfg = store.config();
+            (cfg.clone(), cfg.current.clone())
+        };
         div()
+            .id("apps-scroll")
             .flex_1()
             .h_full()
-            .flex()
-            .items_center()
-            .justify_center()
+            .flex_col()
+            .gap(px(12.))
+            .p(px(20.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(theme::text())
+                                    .child("应用"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme::text_faint())
+                                    .child("受管 AI 编程助手 CLI 应用清单"),
+                            ),
+                    )
+                    .child(
+                        widgets::pill(
+                            format!("{} 个应用", Tool::ALL.len()),
+                            theme::accent(),
+                        ),
+                    ),
+            )
             .child(
                 div()
                     .flex_col()
-                    .items_center()
-                    .gap(px(10.))
-                    .child(
+                    .gap(px(8.))
+                    .children(Tool::ALL.iter().map(|&tool| {
+                        let cur = current.get(tool).and_then(|id| providers.providers.get(id));
+                        let prov_count = providers.providers_for(tool).len();
+                        let route_on = providers.settings.routing_for(tool).enabled;
                         div()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::TEXT))
-                            .child(self.page.label()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child("该功能将在对应里程碑实现"),
-                    ),
+                            .id(("app-card", tool as usize))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.))
+                            .p(px(12.))
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(theme::stroke_a(0.12))
+                            .bg(theme::bg_1().opacity(0.55))
+                            .child(
+                                div()
+                                    .w(px(30.))
+                                    .h(px(30.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(8.))
+                                    .bg(theme::accent_a(0.14))
+                                    .text_size(px(14.))
+                                    .text_color(theme::accent())
+                                    .child(tool.glyph()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(theme::text())
+                                            .child(tool.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(theme::text_faint())
+                                            .child(format!(
+                                                "{} · {} 个供应商 · {}",
+                                                tool.id_str(),
+                                                prov_count,
+                                                if cur.is_some() {
+                                                    format!("当前：{}", cur.unwrap().name)
+                                                } else {
+                                                    "未设置".to_string()
+                                                }
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(if tool.is_switch() {
+                                        widgets::pill("切换", theme::jade())
+                                    } else {
+                                        widgets::pill("共存", theme::accent())
+                                    })
+                                    .child(if tool.supports_routing() {
+                                        widgets::pill(
+                                            if route_on { "路由中" } else { "路由" },
+                                            if route_on {
+                                                theme::jade()
+                                            } else {
+                                                theme::text_dim()
+                                            },
+                                        )
+                                    } else {
+                                        div()
+                                    })
+                                    .child(if tool.supports_aggregation() {
+                                        widgets::pill("聚合", theme::color(theme::ACCENT_2))
+                                    } else {
+                                        div()
+                                    }),
+                            )
+                            .child(
+                                widgets::ghost_button(("app-open", tool as usize), "查看供应商")
+                                    .on_click({
+                                        let t = tool;
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.select_tool(t, cx);
+                                            this.select_page(Page::Providers, cx);
+                                        })
+                                    }),
+                            )
+                    })),
             )
     }
+
 
     /// 切换某工具的路由模式：启用 → 启动代理 + 写 live 配置；停用 → 停止代理。
     fn toggle_routing(&mut self, tool: Tool, cx: &mut Context<Self>) {
@@ -5672,6 +10652,21 @@ impl SwitchApp {
         provider: Option<ns_presets::Provider>,
         cx: &mut Context<Self>,
     ) {
+        // 官方供应商路由边界：官方默认不走代理（直连更优）。
+        // 例外：Codex OpenAI 官方（认证经代理格式转换，需代理）。
+        if !matches!(provider.as_ref().map(|p| p.category), Some(Some(ns_presets::ProviderCategory::Official))) {
+            // 非官方或未知类别：继续。
+        } else if let Some(p) = &provider {
+            let is_codex_openai = tool == Tool::Codex && p.id == "codex-official";
+            if !is_codex_openai {
+                self.routing_status.insert(
+                    tool.id_str().to_string(),
+                    "官方供应商默认直连，不走代理".to_string(),
+                );
+                cx.notify();
+                return;
+            }
+        }
         // 聚合模式：多上游 + 按模型路由；否则单上游。
         let (upstreams, model_routes, status_note) = {
             let store = self.store.read().expect("store lock");
@@ -5704,16 +10699,31 @@ impl SwitchApp {
             cx.notify();
             return;
         }
-        let listen_addr = self
-            .store
-            .read()
-            .map(|s| s.config().settings.routing_for(tool).listen_addr.clone())
-            .unwrap_or_else(|_| "127.0.0.1".into());
+        let (listen_addr, failover_enabled, breaker_threshold, breaker_cooldown) = {
+            let s = self.store.read().expect("store lock");
+            let rc = s.config().settings.routing_for(tool);
+            (
+                rc.listen_addr.clone(),
+                rc.failover,
+                rc.breaker_threshold,
+                rc.breaker_cooldown,
+            )
+        };
         let tool = tool;
         let mut rt = std::mem::take(&mut self.routing);
         cx.spawn(async move |this, cx| {
-            let port =
-                match rt.ensure_running_with(tool, upstreams, model_routes, &listen_addr).await {
+            let port = match rt
+                .ensure_running_with(
+                    tool,
+                    upstreams,
+                    model_routes,
+                    &listen_addr,
+                    failover_enabled,
+                    breaker_threshold,
+                    breaker_cooldown,
+                )
+                .await
+            {
                 Ok(p) => p,
                 Err(e) => {
                     this.update(cx, |this, cx| {
@@ -5836,26 +10846,26 @@ impl SwitchApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(theme::alpha(theme::ACCENT, 0.08))
+                    .bg(theme::accent_a(0.08))
                     .border_1()
-                    .border_color(theme::alpha(theme::STROKE, 0.14))
+                    .border_color(theme::stroke_a(0.14))
                     .child(
                         div()
                             .text_size(px(26.))
-                            .text_color(rgb(theme::ACCENT))
+                            .text_color(theme::accent())
                             .child(self.active_tool.glyph()),
                     ),
             )
             .child(
                 div()
                     .text_size(px(14.))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(theme::text())
                     .child(format!("还没有 {} 的供应商", self.active_tool.label())),
             )
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(theme::TEXT_FAINT))
+                    .text_color(theme::text_faint())
                     .child("点击右上角「添加供应商」从预设库选择"),
             )
             .child(
@@ -5883,81 +10893,317 @@ impl SwitchApp {
             .map(|id| id == &p.id)
             .unwrap_or(false);
         let menu_open = self.open_menu.as_deref() == Some(p.id.as_str());
+        // 复制后的高亮反馈（新副本短暂描边）。
+        let copied = self.copied_provider.as_deref() == Some(p.id.as_str());
+        let _ = copied;
 
         let p_id = p.id.clone();
+        let api_fmt = p
+            .meta
+            .as_ref()
+            .and_then(|m| m.api_format.as_deref())
+            .unwrap_or("anthropic")
+            .to_string();
+        let show_fmt = !matches!(api_fmt.as_str(), "" | "anthropic");
+        let fmt_label = match api_fmt.as_str() {
+            "openai_chat" => "OpenAI Chat".to_string(),
+            "openai_responses" => "OpenAI Resp".to_string(),
+            "gemini_native" => "Gemini".to_string(),
+            _ => api_fmt.clone(),
+        };
+        let subtitle = p
+            .notes
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                p.website_url.as_deref().and_then(|u| {
+                    u.trim()
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .split('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                })
+            })
+            .unwrap_or_else(|| p.id.clone());
+        // 模型名（卡片副标题第二行，对齐 cc-switch 显示当前模型）。
+        let model = provider_model(&p);
+        let is_official = provider_is_official(&p);
+        let icon_bg = p
+            .icon_color
+            .as_deref()
+            .and_then(parse_hex_color)
+            .map(|c| gpui::rgb(c).into())
+            .unwrap_or_else(|| theme::accent());
+        // 是否在故障转移队列（健康芯片显示依据）。
+        let in_queue = p.in_failover_queue;
+        // 模式色边框：当前那张用强调色；复制后的副本用玉色高亮描边。
+        let (card_bg, card_border) = if copied {
+            (theme::surface_alt_a(0.6), theme::jade_a(0.55))
+        } else if is_current {
+            (theme::surface_alt_a(0.6), theme::accent_a(0.45))
+        } else {
+            (theme::surface_a(0.4), theme::stroke_a(0.1))
+        };
         div()
             .id(("provider-card", i))
-            .h(px(72.))
-
-            .px(px(14.))
+            .min_h(px(58.))
+            .px(px(12.))
+            .py(px(10.))
             .flex()
             .items_center()
-            .gap(px(12.))
+            .gap(px(10.))
             .rounded(px(12.))
             .relative()
-            .bg(if is_current {
-                theme::alpha(0x2c2314, 0.6)
-            } else {
-                theme::alpha(0x261d12, 0.4)
-            })
+            .bg(card_bg)
             .border_1()
-            .border_color(if is_current {
-                theme::alpha(theme::ACCENT, 0.45)
-            } else {
-                theme::alpha(theme::STROKE, 0.1)
-            })
+            .border_color(card_border)
             .hover(|style| {
                 style
-                    .border_color(theme::alpha(theme::STROKE, 0.24))
-                    .bg(theme::alpha(0x2c2314, 0.5))
+                    .border_color(theme::stroke_a(0.24))
+                    .bg(theme::surface_alt_a(0.5))
             })
+            // 左拖拽手柄（对齐 cc-switch dragHandle；整卡可拖，手柄为视觉指示）
             .child(
                 div()
-                    .size(px(38.))
+                    .w(px(16.))
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme::text_faint())
+                    .text_size(px(12.))
+                    .child("⠿"),
+            )
+            // 图标
+            .child(
+                div()
+                    .size(px(36.))
                     .rounded_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(theme::gold_gradient())
-                    .text_color(rgb(theme::DARK_TEXT))
-                    .text_size(px(16.))
-                    .child(p.name.chars().next().unwrap_or('?').to_string()),
+                    .bg(icon_bg)
+                    .border_1()
+                    .border_color(theme::stroke_a(0.18))
+                    .text_color(theme::dark_text())
+                    .text_size(px(15.))
+                    .child(icon_glyph(
+                        p.icon.as_deref().unwrap_or(""),
+                        p.name.chars().next().unwrap_or('?'),
+                    )),
             )
+            // 名称/芯片 + 副标题
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .flex_col()
                     .gap(px(3.))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.))
+                            .flex_wrap()
+                            .gap(px(6.))
                             .child(
                                 div()
                                     .text_size(px(12.5))
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(theme::text())
                                     .child(p.name.clone()),
                             )
                             .child(if is_current {
-                                widgets::pill("当前", theme::color(theme::ACCENT))
+                                widgets::pill("当前", theme::accent())
                             } else {
                                 div()
+                            })
+                            .child({
+                                let store = self.store.read().expect("store lock");
+                                let routing = store.config().settings.routing_for(self.active_tool);
+                                let agg = store.config().aggregation_for(self.active_tool);
+                                let mode_pill = if routing.enabled {
+                                    Some(("路由", theme::jade()))
+                                } else if agg.enabled {
+                                    Some(("聚合", theme::color(theme::ACCENT_2)))
+                                } else {
+                                    Some(("直连", theme::text_faint()))
+                                };
+                                match mode_pill {
+                                    Some((label, tone)) => widgets::pill(label, tone),
+                                    None => div(),
+                                }
+                            })
+                            .child(if show_fmt {
+                                widgets::pill(fmt_label, theme::jade())
+                            } else {
+                                div()
+                            })
+                            .child(if in_queue {
+                                widgets::pill("故障转移", theme::color(theme::ACCENT_2))
+                            } else {
+                                div()
+                            })
+                            .child(if is_coding_plan(&p.name) {
+                                widgets::pill("Coding Plan", theme::cinnabar())
+                            } else {
+                                div()
+                            })
+                            .child({
+                                let health = self.health.get(&p_id);
+                                match health {
+                                    Some((true, _)) => {
+                                        widgets::pill("在线", theme::jade())
+                                    }
+                                    Some((false, _)) => {
+                                        widgets::pill("离线", theme::danger())
+                                    }
+                                    None => div(),
+                                }
                             }),
                     )
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child(p.id.clone()),
-                    ),
+                            .text_color(theme::text_faint())
+                            .child(subtitle),
+                    )
+                    .child(if let Some(m) = model {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(theme::text_dim())
+                                    .child(format!("模型 {m}")),
+                            )
+                            .child(if is_official {
+                                widgets::pill("官方", theme::jade())
+                            } else {
+                                div()
+                            })
+                    } else {
+                        div()
+                    }),
             )
+            // 右侧额度列（固定宽，对齐 cc-switch QuotaLines；仅用量查询启用时显示）。
+            .child({
+                let tool_key = self.active_tool.id_str().to_string();
+                let usage_enabled = p
+                    .meta
+                    .as_ref()
+                    .map(|m| m.usage_enabled)
+                    .unwrap_or(true);
+                let usage = if usage_enabled {
+                    self.usage.get(&tool_key).cloned()
+                } else {
+                    None
+                };
+                match usage {
+                    Some(u) if u.remaining.is_some() || u.total.is_some() => {
+                        let mut line = String::new();
+                        let unit = if u.unit.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", u.unit)
+                        };
+                        let currency = u.currency.as_deref().unwrap_or("");
+                        if let Some(total) = u.total {
+                            line.push_str(&format!("{total}{unit}{currency}"));
+                            if let Some(remaining) = u.remaining {
+                                line.push_str(&format!(" · 剩 {remaining}{unit}{currency}"));
+                            }
+                        } else if let Some(remaining) = u.remaining {
+                            line.push_str(&format!("剩 {remaining}{unit}{currency}"));
+                        }
+                        div()
+                            .w(px(150.))
+                            .flex_col()
+                            .items_end()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(theme::text_dim())
+                                    .child(line),
+                            )
+                            .child(if let (Some(total), Some(used)) = (u.total, u.used) {
+                                if total > 0.0 {
+                                    let pct = (used / total).clamp(0.0, 1.0);
+                                    let color = if pct >= 0.9 {
+                                        theme::danger()
+                                    } else if pct >= 0.7 {
+                                        theme::cinnabar()
+                                    } else {
+                                        theme::jade()
+                                    };
+                                    div()
+                                        .w(px(110.))
+                                        .h(px(4.))
+                                        .rounded_full()
+                                        .bg(theme::stroke_a(0.12))
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(px((110. * pct) as f32))
+                                                .rounded_full()
+                                                .bg(color),
+                                        )
+                                } else {
+                                    div()
+                                }
+                            } else {
+                                div()
+                            })
+                            .child(if let Some(reset_at) = u.reset_at {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs() as i64)
+                                    .unwrap_or(0);
+                                if reset_at > now {
+                                    let secs = reset_at - now;
+                                    let h = secs / 3600;
+                                    let m = (secs % 3600) / 60;
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(theme::text_faint())
+                                        .child(format!("⏱ {h}h{m:02}m"))
+                                } else {
+                                    div()
+                                }
+                            } else {
+                                div()
+                            })
+                            .into_any_element()
+                    }
+                    _ => div().into_any_element(),
+                }
+            })
+            // 主操作位 + 更多
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(
+                    .child(if is_current {
+                        // 当前供应商：状态文本（cc-switch 卡片右侧状态）。
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(widgets::status_dot(theme::jade(), 7.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::jade())
+                                    .child("使用中"),
+                            )
+                            .into_any_element()
+                    } else {
                         div()
                             .id(("card-switch", i))
                             .cursor_pointer()
@@ -5968,7 +11214,7 @@ impl SwitchApp {
                             .items_center()
                             .text_size(px(11.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::DARK_TEXT))
+                            .text_color(theme::dark_text())
                             .bg(theme::gold_gradient())
                             .child("切换")
                             .on_click(cx.listener({
@@ -5976,8 +11222,9 @@ impl SwitchApp {
                                 move |this, _, _, cx| {
                                     this.switch_to_provider(&switch_id, cx);
                                 }
-                            })),
-                    )
+                            }))
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .id(("card-menu", i))
@@ -5987,9 +11234,9 @@ impl SwitchApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(theme::text_dim())
                             .text_size(px(14.))
-                            .hover(|s| s.bg(theme::alpha(theme::STROKE, 0.1)))
+                            .hover(|s| s.bg(theme::stroke_a(0.1)))
                             .child("⋯")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_menu = if menu_open { None } else { Some(p_id.clone()) };
@@ -6005,28 +11252,62 @@ impl SwitchApp {
     }
 
     fn render_card_menu(&self, i: usize, p: ns_presets::Provider, cx: &mut Context<Self>) -> Div {
-        div()
+        let has_site = p.website_url.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let mut col = div()
             .absolute()
             .top(px(64.))
             .right(px(12.))
-            .w(px(180.))
+            .w(px(190.))
             .rounded(px(10.))
             .py(px(6.))
-            .bg(theme::color(theme::PANEL_SOLID))
+            .bg(theme::panel())
             .border_1()
-            .border_color(theme::alpha(theme::STROKE, 0.2))
+            .border_color(theme::stroke_a(0.2))
             .shadow_lg()
             .flex_col()
-            .child(self.menu_item("编辑", i, p.id.clone(), cx))
-            .child(self.menu_item("复制", i, p.id.clone(), cx))
-            .child(self.menu_item("导出", i, p.id.clone(), cx))
-            .child(
-                div()
-                    .h(px(1.))
-                    .my(px(4.))
-                    .bg(theme::alpha(theme::STROKE, 0.12)),
-            )
-            .child(self.menu_item_danger("删除", i, p.id.clone(), cx))
+            .child(self.menu_item_action("测试连接", ("menu-test", i), p.id.clone(), cx, |this, id, cx| {
+                this.test_provider_connectivity(&id, cx);
+            }))
+            .child(self.menu_item_action("编辑", ("menu-edit", i), p.id.clone(), cx, |this, id, cx| {
+                this.open_edit_dialog(&id, cx);
+            }));
+        if has_site {
+            col = col.child(self.menu_item_action("打开官网", ("menu-site", i), p.id.clone(), cx, |this, id, cx| {
+                this.open_provider_website(&id, cx);
+            }));
+        }
+        col.child(self.menu_item_action("终端打开配置目录", ("menu-term", i), p.id.clone(), cx, |this, id, cx| {
+            this.open_tool_config_terminal(&id, cx);
+        }))
+        .child(self.menu_item_action("复制供应商", ("menu-dup", i), p.id.clone(), cx, |this, id, cx| {
+            this.duplicate_provider(&id, cx);
+        }))
+        .child(self.menu_item_action("配置用量", ("menu-usage", i), p.id.clone(), cx, |this, id, cx| {
+            this.configure_usage(&id, cx);
+        }))
+        .child(self.menu_item_action(
+            if p.meta.as_ref().map(|m| m.usage_enabled).unwrap_or(true) {
+                "停用用量查询"
+            } else {
+                "启用用量查询"
+            },
+            ("menu-usage-toggle", i),
+            p.id.clone(),
+            cx,
+            |this, id, cx| {
+                this.toggle_usage_enabled(&id, cx);
+            },
+        ))
+        .child(self.menu_item_action("导出此供应商", ("menu-exp", i), p.id.clone(), cx, |this, id, cx| {
+            this.export_single_provider(&id, cx);
+        }))
+        .child(
+            div()
+                .h(px(1.))
+                .my(px(4.))
+                .bg(theme::stroke_a(0.12)),
+        )
+        .child(self.menu_item_danger_action(("menu-del", i), p.id.clone(), cx))
     }
 
     /// 顶部项目切换菜单（B10：默认隐藏，设置开启后显示）。
@@ -6043,9 +11324,9 @@ impl SwitchApp {
             .w(px(220.))
             .rounded(px(10.))
             .py(px(6.))
-            .bg(theme::color(theme::PANEL_SOLID))
+            .bg(theme::panel())
             .border_1()
-            .border_color(theme::alpha(theme::STROKE, 0.2))
+            .border_color(theme::stroke_a(0.2))
             .shadow_lg()
             .flex_col()
             .child(if projects.is_empty() {
@@ -6055,7 +11336,7 @@ impl SwitchApp {
                     .flex()
                     .items_center()
                     .text_size(px(12.))
-                    .text_color(rgb(theme::TEXT_FAINT))
+                    .text_color(theme::text_faint())
                     .child("暂无项目（项目页可保存）")
                     .into_any_element()
             } else {
@@ -6075,20 +11356,25 @@ impl SwitchApp {
                                     .items_center()
                                     .cursor_pointer()
                                     .text_size(px(12.))
-                                    .text_color(rgb(theme::TEXT_DIM))
-                                    .hover(|s| s.bg(theme::alpha(theme::STROKE, 0.08)))
+                                    .text_color(theme::text_dim())
+                                    .hover(|s| s.bg(theme::stroke_a(0.08)))
                                     .child(name.clone())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_menu = None;
+                                        let current_extras = this.project_extras(cx);
                                         let r = {
                                             let mut s = this.store.write().expect("store lock");
-                                            s.apply_project(&name)
+                                            s.apply_project(&name, ns_store::Store::scope_for(this.active_tool), &current_extras)
                                         };
-                                        this.status = match r {
-                                            Ok(()) => format!("已切换项目 {name}"),
-                                            Err(e) => format!("切换失败: {e}"),
-                                        };
-                                        cx.notify();
+                                        match r {
+                                            Ok(ext) => {
+                                                this.apply_project_extras(&ext, cx);
+                                            }
+                                            Err(e) => {
+                                                this.status = format!("切换失败: {e}");
+                                                cx.notify();
+                                            }
+                                        }
                                     }))
                                     .into_any_element()
                             })
@@ -6097,50 +11383,380 @@ impl SwitchApp {
                     .into_any_element()
             })
     }
-    fn menu_item(&self, label: &str, i: usize, id: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn menu_item_action<F>(
+        &self,
+        label: &str,
+        element_id: impl Into<gpui::ElementId>,
+        id: String,
+        cx: &mut Context<Self>,
+        action: F,
+    ) -> impl IntoElement
+    where
+        F: Fn(&mut Self, String, &mut Context<Self>) + 'static,
+    {
         let label = label.to_string();
-        let is_edit = label == "编辑";
-        let id2 = id.clone();
         div()
-            .id(("menu-item", i))
+            .id(element_id)
             .px(px(12.))
             .h(px(30.))
             .flex()
             .items_center()
             .cursor_pointer()
             .text_size(px(12.))
-            .text_color(rgb(theme::TEXT_DIM))
-            .hover(|s| s.bg(theme::alpha(theme::STROKE, 0.08)))
-            .child(label.clone())
+            .text_color(theme::text_dim())
+            .hover(|s| s.bg(theme::stroke_a(0.08)))
+            .child(label)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_menu = None;
-                if is_edit {
-                    this.open_edit_dialog(&id2, cx);
-                } else {
-                    this.status = format!("{label} {id2}（M3 实现）");
-                    cx.notify();
-                }
+                action(this, id.clone(), cx);
             }))
     }
 
-    fn menu_item_danger(&self, label: &str, i: usize, id: String, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = label.to_string();
+    fn menu_item_danger_action(
+        &self,
+        element_id: impl Into<gpui::ElementId>,
+        id: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
-            .id(("menu-item-danger", i))
+            .id(element_id)
             .px(px(12.))
             .h(px(30.))
             .flex()
             .items_center()
             .cursor_pointer()
             .text_size(px(12.))
-            .text_color(rgb(theme::DANGER))
-            .hover(|s| s.bg(theme::alpha(theme::DANGER, 0.12)))
-            .child(label.clone())
+            .text_color(theme::danger())
+            .hover(|s| s.bg(theme::danger_a(0.12)))
+            .child("删除")
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_menu = None;
                 this.confirm_delete = Some(id.clone());
                 cx.notify();
             }))
+    }
+
+    /// 从供应商 settings_config 提取可测试的端点 URL。
+    fn provider_endpoint(p: &ns_presets::Provider) -> Option<String> {
+        fn find(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        if let Some(s) = v.as_str() {
+                            let s = s.trim();
+                            if !s.is_empty()
+                                && keys
+                                    .iter()
+                                    .any(|k2| k.to_lowercase().contains(&k2.to_lowercase()))
+                            {
+                                return Some(s.to_string());
+                            }
+                        }
+                    }
+                    map.values().find_map(|v| find(v, keys))
+                }
+                _ => None,
+            }
+        }
+        let url = find(
+            &p.settings_config,
+            &[
+                "base_url", "endpoint", "baseurl", "url", "host", "server", "api_base",
+            ],
+        )?;
+        let url = url.trim().trim_end_matches('/').to_string();
+        if url.starts_with("http://") || url.starts_with("https://") {
+            Some(url)
+        } else if url.contains('.') || url.starts_with("localhost") || url.starts_with("127.") {
+            Some(format!("https://{url}"))
+        } else {
+            None
+        }
+    }
+
+    fn get_provider(&self, id: &str) -> Option<ns_presets::Provider> {
+        self.store
+            .read()
+            .expect("store lock")
+            .config()
+            .providers
+            .get(id)
+            .cloned()
+    }
+
+    fn test_provider_connectivity(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.get_provider(id) else { return; };
+        let Some(url) = Self::provider_endpoint(&p) else {
+            self.status = format!("测试连接失败（{}）：未找到可用的端点 URL", p.name);
+            cx.notify();
+            return;
+        };
+        let name = p.name.clone();
+        let pid = id.to_string();
+        self.status = format!("正在测试连接：{name} …");
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let out = std::process::Command::new("curl")
+                        .args([
+                            "-sS",
+                            "-o",
+                            "/dev/null",
+                            "-m",
+                            "8",
+                            "-w",
+                            "%{http_code}",
+                            "-I",
+                            &url,
+                        ])
+                        .output();
+                    match out {
+                        Ok(o) => {
+                            let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                            if (o.status.success() || !code.is_empty()) && code != "000" {
+                                Ok(format!("HTTP {code} · {url}"))
+                            } else if err.is_empty() {
+                                Err(format!("无法连接 · {url}"))
+                            } else {
+                                Err(format!("{err} · {url}"))
+                            }
+                        }
+                        Err(e) => Err(format!("执行 curl 失败: {e}")),
+                    }
+                })
+                .await;
+            let (ok, msg) = match result {
+                Ok(ok) => (true, format!("连通性测试通过（{name}）：{ok}")),
+                Err(e) => (false, format!("连通性测试失败（{name}）：{e}")),
+            };
+            this.update(cx, |this, cx| {
+                this.health.insert(pid, (ok, msg.clone()));
+                this.status = msg;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_provider_website(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.get_provider(id) else { return; };
+        let Some(url) = p.website_url.as_ref().filter(|s| !s.trim().is_empty()) else {
+            self.status = format!("{} 未配置官网地址", p.name);
+            cx.notify();
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        let r = std::process::Command::new("open").arg(url).spawn();
+        #[cfg(target_os = "linux")]
+        let r = std::process::Command::new("xdg-open").arg(url).spawn();
+        #[cfg(target_os = "windows")]
+        let r = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let r: std::io::Result<std::process::Child> =
+            Err(std::io::Error::other("unsupported platform"));
+        match r {
+            Ok(_) => self.status = format!("已打开官网：{}", p.name),
+            Err(e) => self.status = format!("打开官网失败：{e}"),
+        }
+        cx.notify();
+    }
+
+    fn tool_config_dir(&self, tool: ns_presets::Tool) -> Option<std::path::PathBuf> {
+        // 用户覆盖优先（对齐 cc-switch DirectorySettings）。
+        let override_dir = self
+            .store
+            .read()
+            .ok()
+            .and_then(|s| s.config().settings.config_dir_for(tool).map(str::to_string));
+        if let Some(d) = override_dir {
+            return Some(std::path::PathBuf::from(d));
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+        Some(match tool {
+            ns_presets::Tool::Claude => home.join(".claude"),
+            ns_presets::Tool::Codex => home.join(".codex"),
+            ns_presets::Tool::Gemini => home.join(".gemini"),
+            ns_presets::Tool::Opencode => home.join(".config").join("opencode"),
+            ns_presets::Tool::Openclaw => home.join(".openclaw"),
+            ns_presets::Tool::Hermes => home.join(".hermes"),
+            ns_presets::Tool::Pi => home.join(".pi").join("agent"),
+            ns_presets::Tool::Kimi => home.join(".kimi"),
+            _ => home.join(format!(".{}", tool.id_str())),
+        })
+    }
+
+    fn open_tool_config_terminal(&mut self, _id: &str, cx: &mut Context<Self>) {
+        let Some(dir) = self.tool_config_dir(self.active_tool) else {
+            self.status = "无法定位 HOME 目录".into();
+            cx.notify();
+            return;
+        };
+        let target = if dir.exists() {
+            dir.clone()
+        } else if let Some(p) = dir.parent().filter(|p| p.exists()) {
+            p.to_path_buf()
+        } else {
+            std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or(dir)
+        };
+        #[cfg(target_os = "macos")]
+        let r = std::process::Command::new("open")
+            .args(["-a", "Terminal"])
+            .arg(&target)
+            .spawn();
+        #[cfg(target_os = "linux")]
+        let r = std::process::Command::new("x-terminal-emulator")
+            .arg(format!("--working-directory={}", target.display()))
+            .spawn()
+            .or_else(|_| std::process::Command::new("xdg-open").arg(&target).spawn());
+        #[cfg(target_os = "windows")]
+        let r = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "start",
+                "cmd",
+                "/K",
+                &format!("cd /d {}", target.display()),
+            ])
+            .spawn();
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let r: std::io::Result<std::process::Child> =
+            Err(std::io::Error::other("unsupported platform"));
+        match r {
+            Ok(_) => self.status = format!("已在终端打开：{}", target.display()),
+            Err(e) => self.status = format!("打开终端失败：{e}"),
+        }
+        cx.notify();
+    }
+
+    fn duplicate_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.get_provider(id) else { return; };
+        let new_id = format!("{}-copy-{}", p.id, now_ts_suffix());
+        let mut dup = p.clone();
+        dup.id = new_id.clone();
+        dup.name = format!("{}（副本）", p.name);
+        dup.created_at = Some(now_ts());
+        let name = dup.name.clone();
+        let res = self.store.write().expect("store lock").add_provider(dup);
+        match res {
+            Ok(()) => {
+                self.status = format!("已复制供应商：{name}");
+                self.status_tone = StatusTone::Success;
+                // 新副本短暂高亮（复制后反馈定位）。
+                self.copied_provider = Some(new_id);
+            }
+            Err(e) => {
+                self.status = format!("复制供应商失败：{e}");
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+        // 复制高亮短暂展示后自动清除（反馈定位，不长期驻留）。
+        let copied = self.copied_provider.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.copied_provider == copied {
+                    this.copied_provider = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn export_single_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.get_provider(id) else { return; };
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let dir = home
+            .unwrap_or_else(|| std::env::temp_dir())
+            .join(".ns-switch")
+            .join("exports");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("导出失败：{e}");
+            cx.notify();
+            return;
+        }
+        let safe: String = p
+            .id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("{safe}.json"));
+        let json = match serde_json::to_string_pretty(&serde_json::json!({ "providers": [p] })) {
+            Ok(j) => j,
+            Err(e) => {
+                self.status = format!("导出失败：{e}");
+                cx.notify();
+                return;
+            }
+        };
+        match std::fs::write(&path, json) {
+            Ok(()) => {
+                self.status = format!("已导出供应商到：{}", path.display());
+                self.status_tone = StatusTone::Success;
+            }
+            Err(e) => {
+                self.status = format!("导出失败：{e}");
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 配置供应商用量脚本路径（直接打开编辑对话框并预填用量脚本字段）。
+    /// 切换某供应商的用量查询启用/停用（直接写 meta，无需打开对话框）。
+    fn toggle_usage_enabled(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.get_provider(id) else { return; };
+        let mut provider = p;
+        let mut meta = provider.meta.take().unwrap_or_default();
+        meta.usage_enabled = !meta.usage_enabled;
+        provider.meta = Some(meta);
+        let name = provider.name.clone();
+        let enabled = provider.meta.as_ref().map(|m| m.usage_enabled).unwrap_or(true);
+        let result = {
+            let mut store = self.store.write().expect("store lock");
+            store.update_provider(provider)
+        };
+        match result {
+            Ok(()) => {
+                self.status = format!(
+                    "{} 用量查询: {}",
+                    name,
+                    if enabled { "启用" } else { "停用" }
+                );
+                self.status_tone = StatusTone::Success;
+            }
+            Err(e) => {
+                self.status = format!("保存失败: {e}");
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    fn configure_usage(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(p) = self.get_provider(id) else { return; };
+        self.open_edit_dialog(id, cx);
+        // 预填用量脚本路径到对话框字段。
+        let usage_script = p
+            .meta
+            .as_ref()
+            .and_then(|m| m.usage_script.clone())
+            .unwrap_or_default();
+        self.dialog_inputs
+            .usage_script
+            .update(cx, |f, _| f.set_text(&usage_script));
+        self.status = format!("配置用量脚本：{}", p.name);
+        cx.notify();
     }
 
     fn open_edit_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -6184,6 +11800,14 @@ impl SwitchApp {
         self.dialog_inputs
             .usage_script
             .update(cx, |f, _| f.set_text(&usage_script));
+        let icon = self.dialog_fields.icon.clone();
+        self.dialog_inputs
+            .icon
+            .update(cx, |f, _| f.set_text(&icon));
+        let icon_color = self.dialog_fields.icon_color.clone();
+        self.dialog_inputs
+            .icon_color
+            .update(cx, |f, _| f.set_text(&icon_color));
         self.dialog_inputs
             .search
             .update(cx, |f, _| f.set_text(""));
@@ -6191,25 +11815,32 @@ impl SwitchApp {
     }
 
     fn render_statusbar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let lang = crate::i18n::Lang::parse(
+            &self
+                .store
+                .read()
+                .map(|s| s.config().settings.language.clone())
+                .unwrap_or_else(|_| "zh-cn".into()),
+        );
         div()
             .h(px(30.))
             .px(px(12.))
             .flex()
             .items_center()
             .justify_between()
-            .bg(theme::color(theme::BG_1).opacity(0.78))
+            .bg(theme::bg_1().opacity(0.78))
             .border_t_1()
-            .border_color(theme::alpha(theme::STROKE, 0.1))
+            .border_color(theme::stroke_a(0.1))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(widgets::status_dot(theme::color(theme::JADE), 7.))
+                    .child(widgets::status_dot(self.status_tone.color(), 7.))
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(rgb(theme::TEXT_DIM))
+                            .text_color(self.status_tone.color())
                             .child(self.status.clone()),
                     ),
             )
@@ -6221,11 +11852,41 @@ impl SwitchApp {
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(theme::TEXT_FAINT))
-                            .child(format!("当前: {}", self.active_tool.label())),
+                            .text_color(theme::text_faint())
+                            .child(format!(
+                                "{}: {}",
+                                crate::i18n::t(lang, "status.current"),
+                                self.active_tool.label()
+                            )),
                     )
+                    .child(self.render_shortcut_hint())
                     .child(widgets::section_label("v0.1.0")),
             )
+    }
+    
+    fn render_shortcut_hint(&self) -> Div {
+        // 每页操作提示（界面内可发现性）；全局键在所有页适用。
+        let page_hint = match self.page {
+            Page::Providers => "⌘F 搜索供应商 · ⌘R 刷新",
+            Page::Routing => "路由开关/故障转移每工具独立",
+            Page::Mcp => "MCP 跨工具同步 · Esc 关闭对话框",
+            Page::Skills => "安装/同步 · Esc 关闭对话框",
+            Page::Prompts => "写回合并 · Esc 关闭对话框",
+            Page::Usage => "用量趋势/热力图",
+            Page::Tools => "安装/升级/全部升级",
+            Page::Projects => "保存/应用/删除项目快照",
+            Page::Sessions => "列表/搜索/阅读视图",
+            Page::Accounts => "托管账号 Beta",
+            Page::Apps => "应用配置/重复安装诊断",
+            Page::Universal => "工具配置全文编辑",
+            Page::ToolConfig => "配置文件编辑",
+            Page::Settings => "通用/应用配置/路由/网络/数据/关于",
+        };
+        let hint = format!("{page_hint} · ⌘1-9 切换页面 · ⌘S 保存 · Esc 关闭");
+        div()
+            .text_size(px(9.))
+            .text_color(theme::text_faint().opacity(0.6))
+            .child(hint)
     }
 
     fn render_add_dialog(&self, cx: &mut Context<Self>) -> Div {
@@ -6245,6 +11906,70 @@ impl SwitchApp {
             &self.dialog_inputs,
             cx,
         )
+    }
+
+    /// 对话框未保存更改确认浮层（关闭前提醒）。
+    fn render_dialog_confirm_close(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.dialog_dirty {
+            return div().into_any_element();
+        }
+        div()
+            .id("dialog-close-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::alpha(0x000000, 0.55))
+            .child(
+                div()
+                    .w(px(360.))
+                    .rounded(px(12.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.25))
+                    .shadow_lg()
+                    .p(px(20.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child("未保存的更改"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text_dim())
+                            .child("对话框中有未保存的修改。确定要放弃这些更改并关闭吗？"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("dlg-guard-cancel", "继续编辑")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dialog_dirty = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                widgets::danger_button("dlg-guard-discard", "放弃更改")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.dialog_dirty = false;
+                                        this.add_open = false;
+                                        this.edit_id = None;
+                                        this.dialog_preset = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_confirm_delete(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6283,9 +12008,9 @@ impl SwitchApp {
                 div()
                     .w(px(380.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::DANGER, 0.4))
+                    .border_color(theme::danger_a(0.4))
                     .shadow_lg()
                     .p(px(18.))
                     .flex_col()
@@ -6294,19 +12019,19 @@ impl SwitchApp {
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::DANGER))
+                            .text_color(theme::danger())
                             .child("删除供应商"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(format!("确定删除「{name}」？此操作不可撤销。")),
                     )
                     .child(if is_current {
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(theme::DANGER))
+                            .text_color(theme::danger())
                             .child("该供应商正在被使用，请先切换到其他供应商再删除。")
                             .into_any_element()
                     } else {
@@ -6346,13 +12071,95 @@ impl SwitchApp {
                                             Ok(()) => format!("已删除供应商 {name}"),
                                             Err(e) => format!("删除失败: {e}"),
                                         };
+                                        this.status_tone = if ok { StatusTone::Success } else { StatusTone::Error };
                                         if ok {
                                             this.refresh_tray_menu(cx);
                                         }
-                                        cx.notify();
                                     }))
                                     .into_any_element()
                             }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 写入冲突确认浮层：确认后强制执行切换，取消则放弃。
+    fn render_switch_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some((tool, provider, note)) = self.pending_switch.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .id("switch-confirm-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("switch-confirm")
+                    .w(px(440.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("切换冲突确认"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "即将切换到 {}（{}），但检测到目标配置被占用/修改。",
+                                provider.name,
+                                tool.label()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(theme::cinnabar())
+                            .child(format!("⚠ {}", note)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child("继续写入会覆盖这些字段；首次改写前的配置已自动备份。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button(("switch-confirm-cancel", 0usize), "取消")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.pending_switch = None;
+                                        this.status = "已取消切换".into();
+                                        this.status_tone = StatusTone::Neutral;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                widgets::primary_button(("switch-confirm-ok", 0usize), "继续切换")
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.pending_switch = None;
+                                            this.apply_switch(tool, &provider, cx);
+                                        },
+                                    )),
+                            ),
                     ),
             )
             .into_any_element()
@@ -6386,9 +12193,9 @@ impl SwitchApp {
                 div()
                     .w(px(380.))
                     .rounded(px(14.))
-                    .bg(theme::color(theme::PANEL_SOLID))
+                    .bg(theme::panel())
                     .border_1()
-                    .border_color(theme::alpha(theme::DANGER, 0.4))
+                    .border_color(theme::danger_a(0.4))
                     .shadow_lg()
                     .p(px(18.))
                     .flex_col()
@@ -6397,13 +12204,13 @@ impl SwitchApp {
                         div()
                             .text_size(px(14.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme::DANGER))
+                            .text_color(theme::danger())
                             .child("删除通用供应商"),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(theme::text())
                             .child(format!(
                                 "确定删除「{name}」？其 Claude/Codex/Gemini 子供应商也会一并删除。"
                             )),
@@ -6457,6 +12264,15 @@ pub fn now_ts_suffix() -> String {
     format!("{}", now_ts())
 }
 
+/// 解析 `#RRGGBB`/`RRGGBB` 为 0xRRGGBB。
+fn parse_hex_color(s: &str) -> Option<u32> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    u32::from_str_radix(s, 16).ok()
+}
+
 /// MCP 传输类型短标签（用于药丸/徽章与元素 id）。
 fn transport_label(transport: McpTransport) -> &'static str {
     match transport {
@@ -6479,7 +12295,11 @@ impl Render for SwitchApp {
                 .map(|s| s.config().settings.theme.clone())
                 .unwrap_or_else(|_| "dark".into()),
         );
-        let pal = theme::palette(mode);
+        // 仅在配置值变化时更新全局主题（避免 System 模式下每帧探测）。
+        if ns_ui::theme::active_mode() != mode {
+            ns_ui::theme::set_active_mode(mode);
+        }
+        let pal = ns_ui::theme::active_palette();
         let content: Stateful<Div> = div()
             .id("page-content")
             .flex_1()
@@ -6504,7 +12324,7 @@ impl Render for SwitchApp {
                 Page::Universal => self.render_universal_page(cx).into_any_element(),
                 Page::ToolConfig => self.render_toolconfig_page(cx).into_any_element(),
                 Page::Settings => self.render_settings_page(cx).into_any_element(),
-                Page::Apps => self.render_placeholder_page(cx).into_any_element(),
+                Page::Apps => self.render_apps_page(cx).into_any_element(),
             });
 
         div()
@@ -6534,6 +12354,15 @@ impl Render for SwitchApp {
             .on_action(cx.listener(|this, _: &TogglePage3, _, cx| this.goto_page(3, cx)))
             .on_action(cx.listener(|this, _: &TogglePage4, _, cx| this.goto_page(4, cx)))
             .on_action(cx.listener(|this, _: &TogglePage5, _, cx| this.goto_page(5, cx)))
+            .on_action(cx.listener(|this, _: &TogglePage6, _, cx| this.goto_page(6, cx)))
+            .on_action(cx.listener(|this, _: &TogglePage7, _, cx| this.goto_page(7, cx)))
+            .on_action(cx.listener(|this, _: &TogglePage8, _, cx| this.goto_page(8, cx)))
+            .on_action(cx.listener(|this, _: &EscapeDialog, _, cx| this.escape_dialog(cx)))
+            .on_action(cx.listener(|this, _: &SaveCurrent, _, cx| this.save_current(cx)))
+            .on_action(cx.listener(|this, _: &FocusProviderSearch, window, cx| {
+                let handle = this.provider_search.read(cx).focus_handle();
+                window.focus(&handle);
+            }))
             .child(self.render_topbar(cx))
             .child(
                 div()
@@ -6555,6 +12384,8 @@ impl Render for SwitchApp {
                 div().into_any_element()
             })
             .child(self.render_confirm_delete(cx))
+            .child(self.render_dialog_confirm_close(cx))
+            .child(self.render_switch_confirm(cx))
             .child(if self.open_menu.as_deref() == Some("project") {
                 self.render_project_menu(cx).into_any_element()
             } else {
@@ -6577,11 +12408,49 @@ impl Render for SwitchApp {
             } else {
                 div().into_any_element()
             })
+            .child(if self.daily_memory_editing.is_some() {
+                self.render_daily_memory_editor(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.daily_memory_confirm_delete.is_some() {
+                self.render_daily_memory_confirm_delete(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.openclaw_defaults_open {
+                self.render_openclaw_defaults_editor(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.welcome_visible {
+                self.render_welcome(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.whats_new_visible {
+                self.render_whats_new(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.pending_switch.is_some() {
+                self.render_pending_switch_confirm(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.deeplink_pending.is_some() {
+                self.render_deeplink_confirm(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
 }
 }
 
 /// 从存储快照构建托盘菜单条目（每工具列出供应商，标记当前）。
-fn tray_entries(store: &RwLock<Store>) -> Vec<tray::ToolMenuEntry> {
+fn tray_entries(
+    store: &RwLock<Store>,
+    usage: &std::collections::BTreeMap<String, ns_usage::Usage>,
+) -> Vec<tray::ToolMenuEntry> {
     let cfg = store.read().expect("store lock").config().clone();
     let mut entries = Vec::new();
     for tool in Tool::ALL {
@@ -6595,11 +12464,227 @@ fn tray_entries(store: &RwLock<Store>) -> Vec<tray::ToolMenuEntry> {
                 (p.id.clone(), p.name.clone(), is_current)
             })
             .collect();
+        // 用量摘要（当前供应商的配额/剩余/重置倒计时；仅用量查询启用时显示）。
+        let usage_enabled = current_id
+            .as_ref()
+            .and_then(|id| cfg.providers.get(id))
+            .and_then(|p| p.meta.as_ref())
+            .map(|m| m.usage_enabled)
+            .unwrap_or(true);
+        let usage_note = if usage_enabled {
+            usage.get(tool.id_str()).and_then(|u| {
+            let unit = if u.unit.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", u.unit)
+            };
+            let currency = u.currency.as_deref().unwrap_or("");
+            let mut parts = Vec::new();
+            if let Some(remaining) = u.remaining {
+                parts.push(format!("剩 {remaining}{unit}{currency}"));
+            } else if let Some(total) = u.total {
+                parts.push(format!("总量 {total}{unit}{currency}"));
+            }
+            if let Some(reset_at) = u.reset_at {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if reset_at > now {
+                    let secs = reset_at - now;
+                    let h = secs / 3600;
+                    let m = (secs % 3600) / 60;
+                    parts.push(format!("⏱ {h}h{m:02}m"));
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" · "))
+            }
+        })
+        } else {
+            None
+        };
         entries.push(tray::ToolMenuEntry {
             tool,
             routing,
             providers,
+            usage_note,
         });
     }
     entries
 }
+
+/// 欢迎页引导行（序号 + 标题 + 描述）。
+fn welcome_row(
+    num: &'static str,
+    title: &'static str,
+    desc: &'static str,
+    _pal: ns_ui::theme::Palette,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(theme::stroke_a(0.14))
+        .bg(theme::bg_1().opacity(0.5))
+        .px(px(14.))
+        .py(px(10.))
+        .child(
+            div()
+                .size(px(26.))
+                .rounded_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme::accent_a(0.2))
+                .text_size(px(12.))
+                .text_color(theme::accent())
+                .child(num),
+        )
+        .child(
+            div()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_faint())
+                        .child(desc),
+                ),
+        )
+}
+
+/// 供应商是否为 Coding Plan / Token Plan（按名称关键词派生，不新增字段）。
+fn is_coding_plan(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("coding plan") || n.contains("token plan") || n.contains("coding-plan")
+        || n.contains("token-plan")
+}
+
+/// 从供应商 settings_config 提取当前模型名（用于卡片副标题）。
+/// 扫描顶层与 `env`/`auth`/`config`/`model` 键，取第一个非空字符串模型。
+fn provider_model(p: &ns_presets::Provider) -> Option<String> {
+    fn find_model(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let kl = k.to_lowercase();
+                    if kl == "model"
+                        || kl == "default_model"
+                        || kl == "defaultmodel"
+                        || kl == "model_name"
+                        || kl.contains("modelname")
+                    {
+                        if let Some(s) = v.as_str() {
+                            let t = s.trim();
+                            if !t.is_empty() {
+                                return Some(t.to_string());
+                            }
+                        }
+                        if let Some(s) = find_model(v) {
+                            return Some(s);
+                        }
+                    } else if let Some(s) = find_model(v) {
+                        // 只在嵌套对象（env/auth/config/model 容器）内继续搜索。
+                        return Some(s);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    find_model(&p.settings_config)
+}
+
+/// 判断供应商是否为官方（category == official 或无自定义端点/key）。
+fn provider_is_official(p: &ns_presets::Provider) -> bool {
+    if matches!(
+        p.category,
+        Some(ns_presets::ProviderCategory::Official)
+    ) {
+        return true;
+    }
+    // 无自定义端点且无 key 的 Claude/Codex/Gemini 官方账号视为官方。
+    let cfg = &p.settings_config;
+    let text = serde_json::to_string(cfg).unwrap_or_default().to_lowercase();
+    let has_endpoint = text.contains("base_url")
+        || text.contains("baseurl")
+        || text.contains("endpoint")
+        || text.contains("anthropic_base_url");
+    let has_key = text.contains("api_key")
+        || text.contains("apikey")
+        || text.contains("auth_token")
+        || text.contains("openai_api_key")
+        || text.contains("gemini_api_key");
+    !has_endpoint && !has_key
+}
+
+/// 品牌图标 id → 显示字形（图标字符映射；未知 id 回退首字母）。
+fn icon_glyph(icon_id: &str, fallback: char) -> String {
+    let g = match icon_id {
+        "anthropic" => '❋',
+        "openai" => '⬡',
+        "google" => '◆',
+        "grok" => '✦',
+        "copilot" => '⌥',
+        "api" => '⌁',
+        "router" => '⛶',
+        "cloud" => '☁',
+        "code" => '⌘',
+        "sub" => '⧉',
+        "flow" => '≋',
+        "local" => '⬢',
+        "mini" => '▣',
+        "kimi" => '✳',
+        "pi" => 'π',
+        "hermes" => '⚡',
+        "claw" => '✪',
+        "omp" => '◉',
+        _ => fallback,
+    };
+    g.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_tokens, icon_glyph, is_coding_plan};
+
+    #[test]
+    fn coding_plan_detection() {
+        assert!(is_coding_plan("火山 Coding Plan"));
+        assert!(is_coding_plan("Tencent Token Plan"));
+        assert!(is_coding_plan("compshare-coding-plan"));
+        assert!(!is_coding_plan("88API"));
+        assert!(!is_coding_plan("OpenRouter"));
+        assert!(!is_coding_plan("OpenRouter"));
+    }
+
+    #[test]
+    fn icon_glyph_maps_brands() {
+        assert_eq!(icon_glyph("anthropic", '?'), "❋");
+        assert_eq!(icon_glyph("openai", '?'), "⬡");
+        assert_eq!(icon_glyph("unknown", 'X'), "X");
+        assert_eq!(icon_glyph("", 'A'), "A");
+    }
+
+    #[test]
+    fn format_tokens_scales() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(500), "500");
+        assert_eq!(format_tokens(1500), "1.5k");
+        assert_eq!(format_tokens(2_000_000), "2.0M");
+        assert_eq!(format_tokens(26_274_810), "26.3M");
+    }
+}
+

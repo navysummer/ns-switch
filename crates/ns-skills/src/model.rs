@@ -39,6 +39,8 @@ pub struct Skill {
     pub body: String,
     /// 源文件路径（安装来源；None = 原生）。
     pub source_path: Option<PathBuf>,
+    /// 源 GitHub 仓库 URL（安装来源；None = 非 GitHub）。
+    pub repo_url: Option<String>,
     /// 是否启用（禁用 = 不在目标工具落盘）。
     pub enabled: bool,
 }
@@ -51,6 +53,7 @@ impl Default for Skill {
             allowed_tools: Vec::new(),
             body: String::new(),
             source_path: None,
+            repo_url: None,
             enabled: true,
         }
     }
@@ -71,6 +74,8 @@ impl Skill {
 #[derive(Debug, Clone)]
 pub struct SkillPaths {
     pub home: PathBuf,
+    /// 是否使用共享 `~/.agents/skills` 目录（true = 所有工具共用）。
+    pub shared: bool,
 }
 
 impl SkillPaths {
@@ -79,7 +84,7 @@ impl SkillPaths {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("."));
-        Self { home }
+        Self { home, shared: false }
     }
 
     /// Claude Code 用户 skills 目录（`~/.claude/skills`）。

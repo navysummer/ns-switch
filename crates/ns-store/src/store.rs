@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use ns_presets::{CurrentSelection, Provider, ProviderCategory, Tool};
+use sha2::Digest;
 
 /// 每工具路由模式配置（本地代理）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +28,20 @@ pub struct RoutingConfig {
     pub listen_addr: String,
     /// 故障转移：上游失败时尝试下一供应商。
     pub failover: bool,
+    /// 熔断器失败阈值（连续失败 N 次打开；默认 3）。
+    #[serde(default = "default_breaker_threshold")]
+    pub breaker_threshold: u32,
+    /// 熔断器冷却秒数（打开后重试前等待；默认 30）。
+    #[serde(default = "default_breaker_cooldown")]
+    pub breaker_cooldown: u32,
+}
+
+fn default_breaker_threshold() -> u32 {
+    3
+}
+
+fn default_breaker_cooldown() -> u32 {
+    30
 }
 
 impl Default for RoutingConfig {
@@ -36,6 +51,8 @@ impl Default for RoutingConfig {
             port: 0,
             listen_addr: "127.0.0.1".into(),
             failover: false,
+            breaker_threshold: 3,
+            breaker_cooldown: 30,
         }
     }
 }
@@ -81,6 +98,9 @@ pub struct SyncConfig {
     /// S3 bucket（WebDAV 忽略）。
     pub bucket: String,
     pub enabled: bool,
+    /// 自动同步间隔（分钟；0 = 关闭）。
+    #[serde(default)]
+    pub auto_sync_minutes: u32,
 }
 
 impl Default for SyncConfig {
@@ -92,6 +112,7 @@ impl Default for SyncConfig {
             password: String::new(),
             bucket: String::new(),
             enabled: false,
+            auto_sync_minutes: 0,
         }
     }
 }
@@ -105,11 +126,28 @@ pub struct Settings {
     pub project_switcher: bool,
     pub visible_apps: BTreeMap<String, bool>,
     pub app_order: Vec<String>,
+    /// 首次运行欢迎页是否已关闭。
+    pub welcome_dismissed: bool,
+    /// 上次启动见过的应用版本（WhatsNew 检测用；空 = 首次）。
+    pub last_seen_version: String,
     /// 每工具路由配置（key = 工具 `id_str()`）。
 
     pub routing: BTreeMap<String, RoutingConfig>,
     /// 云同步配置。
     pub sync: SyncConfig,
+    /// 是否使用共享 `~/.agents/skills` 目录（Skills 全工具共用）。
+    pub shared_skills: bool,
+    /// 自定义模型定价（key = 模型名前缀，value = {input_per_mtok,
+    /// output_per_mtok, cache_read_per_mtok}）。覆盖内置价格表。
+    #[serde(default)]
+    pub custom_pricing: BTreeMap<String, serde_json::Value>,
+    /// 全局出站代理 URL（None/空 = 直连）。ns-switch 自身出站请求（curl）经此代理。
+    #[serde(default)]
+    pub global_proxy: Option<String>,
+    /// 每工具配置目录覆盖（key = 工具 `id_str()`，value = 绝对路径）。
+    /// 空/缺失 = 使用默认 `~/.<tool>`。对齐 cc-switch `DirectorySettings`。
+    #[serde(default)]
+    pub config_dirs: BTreeMap<String, String>,
 }
 
 impl Settings {
@@ -125,6 +163,65 @@ impl Settings {
     pub fn set_routing(&mut self, tool: Tool, cfg: RoutingConfig) {
         self.routing.insert(tool.id_str().to_string(), cfg);
     }
+
+
+    /// 设置自定义模型定价（覆盖内置；input/output/cache 为 USD/1M tokens）。
+    pub fn set_custom_price(
+        &mut self,
+        model: &str,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        cache_read_per_mtok: Option<f64>,
+    ) {
+        let mut v = serde_json::Map::new();
+        v.insert("input_per_mtok".into(), serde_json::json!(input_per_mtok));
+        v.insert("output_per_mtok".into(), serde_json::json!(output_per_mtok));
+        if let Some(c) = cache_read_per_mtok {
+            v.insert("cache_read_per_mtok".into(), serde_json::json!(c));
+        }
+        self.custom_pricing
+            .insert(model.to_string(), serde_json::Value::Object(v));
+    }
+
+    /// 删除自定义模型定价。
+    pub fn remove_custom_price(&mut self, model: &str) {
+        self.custom_pricing.remove(model);
+    }
+
+    /// 当前全局出站代理 URL（None/空 = 直连）。
+    pub fn global_proxy(&self) -> Option<&str> {
+        self.global_proxy
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// 设置全局出站代理（空字符串 = 清除/直连）。
+    pub fn set_global_proxy(&mut self, url: &str) {
+        let trimmed = url.trim();
+        self.global_proxy = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    /// 某工具的配置目录覆盖（`config_dirs`；None = 用默认）。
+    pub fn config_dir_for(&self, tool: Tool) -> Option<&str> {
+        self.config_dirs
+            .get(tool.id_str())
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// 设置某工具的配置目录覆盖（空字符串 = 清除覆盖/恢复默认）。
+    pub fn set_config_dir(&mut self, tool: Tool, dir: &str) {
+        let trimmed = dir.trim();
+        if trimmed.is_empty() {
+            self.config_dirs.remove(tool.id_str());
+        } else {
+            self.config_dirs.insert(tool.id_str().to_string(), trimmed.to_string());
+        }
+    }
 }
 
 impl Default for Settings {
@@ -135,8 +232,14 @@ impl Default for Settings {
             project_switcher: false,
             visible_apps: BTreeMap::new(),
             app_order: Vec::new(),
+            welcome_dismissed: false,
+            last_seen_version: String::new(),
             routing: BTreeMap::new(),
             sync: SyncConfig::default(),
+            shared_skills: false,
+            custom_pricing: BTreeMap::new(),
+            global_proxy: None,
+            config_dirs: BTreeMap::new(),
         }
     }
 }
@@ -159,6 +262,14 @@ pub struct Config {
     pub universal: BTreeMap<String, ns_presets::UniversalProvider>,
     /// 托管账号（Beta，key = 账号 id）。
     pub accounts: BTreeMap<String, HostedAccount>,
+    /// 当前激活的项目快照名（None = 未激活任何项目）。
+    /// 兼容字段：`active_projects` 优先（cc-switch Profile 语义对齐，
+    /// 每工具组独立当前项目）；旧配置仅此字段时回退为 Claude 组。
+    pub active_project: Option<String>,
+    /// 每工具组当前激活的项目快照名（key = 工具 `id_str()`，cc-switch
+    /// Profile 语义：Claude 组=Claude+ClaudeDesktop，其余每工具一组）。
+    #[serde(default)]
+    pub active_projects: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -171,6 +282,8 @@ impl Default for Config {
             projects: BTreeMap::new(),
             universal: BTreeMap::new(),
             accounts: BTreeMap::new(),
+            active_project: None,
+            active_projects: BTreeMap::new(),
         }
     }
 }
@@ -183,6 +296,10 @@ pub struct ProjectSnapshot {
     pub selections: BTreeMap<String, String>,
     /// 每工具聚合配置（key = 工具 `id_str()`）。
     pub aggregation: BTreeMap<String, AggregationConfig>,
+    /// 扩展范围快照（MCP/Skills/Prompts 等，key = 资源名，JSON 载体）。
+    /// 向后兼容：`#[serde(default)]`，旧快照无此字段。
+    #[serde(default)]
+    pub extras: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for ProjectSnapshot {
@@ -190,9 +307,11 @@ impl Default for ProjectSnapshot {
         Self {
             selections: BTreeMap::new(),
             aggregation: BTreeMap::new(),
+            extras: BTreeMap::new(),
         }
     }
 }
+
 
 /// 托管账号（Beta：Copilot / ChatGPT / xAI 订阅作为供应商）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,13 +654,17 @@ impl Store {
         self.save()
     }
 
-    /// 列出项目快照名（排序）。
-    pub fn list_projects(&self) -> Vec<String> {
-        self.config.projects.keys().cloned().collect()
-    }
-
-    /// 保存当前状态为项目快照（current + aggregation）。
-    pub fn save_project(&mut self, name: &str) -> Result<()> {
+    /// 保存当前状态为项目快照（current + aggregation + extras）。
+    ///
+    /// `scope`：当前工具组（cc-switch Profile 语义，工具 `id_str()`）。
+    /// `extras`：扩展范围快照（MCP/Skills/Prompts 等，key = 资源名，
+    /// 由调用方收集的 JSON 载体）；空 map 时仅快照供应商/聚合（向后兼容）。
+    pub fn save_project(
+        &mut self,
+        name: &str,
+        scope: &str,
+        extras: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
         let mut snap = ProjectSnapshot::default();
         for tool in Tool::ALL {
             let key = tool.id_str().to_string();
@@ -552,15 +675,49 @@ impl Store {
                 snap.aggregation.insert(key, cfg.clone());
             }
         }
+        snap.extras = extras.clone();
         self.config.projects.insert(name.to_string(), snap);
+        self.config.active_project = Some(name.to_string());
+        self.config
+            .active_projects
+            .insert(scope.to_string(), name.to_string());
         self.save()
     }
 
-    /// 应用项目快照到 current + aggregation。
-    pub fn apply_project(&mut self, name: &str) -> Result<()> {
+    /// 应用项目快照到 current + aggregation；返回目标项目的 extras。
+    ///
+    /// `scope`：当前工具组（cc-switch Profile 语义，工具 `id_str()`）。
+    /// `current_extras`：当前激活项目的 extras（用于自动回存；调用方传
+    /// 当前 UI 收集的资源状态）。切换前自动把当前 scope 的激活项目保存
+    /// 为快照，避免切换后丢失上一个项目的状态。首次应用无激活则不回存。
+    pub fn apply_project(
+        &mut self,
+        name: &str,
+        scope: &str,
+        current_extras: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<BTreeMap<String, serde_json::Value>> {
         let Some(snap) = self.config.projects.get(name).cloned() else {
             bail!("项目不存在: {name}");
         };
+        // 自动回存当前 scope 的激活项目（若非目标项目且存在）。
+        let prev = self
+            .config
+            .active_projects
+            .get(scope)
+            .cloned()
+            .or_else(|| {
+                // 兼容：旧配置仅 active_project（视为 Claude 组）。
+                if scope == "claude" || scope == "claude-desktop" {
+                    self.config.active_project.clone()
+                } else {
+                    None
+                }
+            });
+        if let Some(prev_name) = &prev {
+            if prev_name != name {
+                self.save_project(prev_name, scope, current_extras)?;
+            }
+        }
         for (key, id) in &snap.selections {
             if let Some(tool) = Tool::ALL.iter().find(|t| t.id_str() == key) {
                 if self.config.providers.contains_key(id) {
@@ -571,8 +728,44 @@ impl Store {
         for (key, cfg) in &snap.aggregation {
             self.config.aggregation.insert(key.clone(), cfg.clone());
         }
-        self.save()
+        self.config.active_project = Some(name.to_string());
+        self.config
+            .active_projects
+            .insert(scope.to_string(), name.to_string());
+        self.save()?;
+        Ok(snap.extras)
     }
+
+    /// 工具组 scope（cc-switch Profile 语义）：Claude+ClaudeDesktop 同组
+    /// "claude"，其余工具各自 `id_str()`。
+    pub fn scope_for(tool: Tool) -> &'static str {
+        match tool {
+            Tool::Claude | Tool::ClaudeDesktop => "claude",
+            other => other.id_str(),
+        }
+    }
+
+    /// 某工具组当前激活的项目名（`active_projects` 优先，兼容 `active_project`）。
+    pub fn active_project_for(&self, tool: Tool) -> Option<String> {
+        let scope = Self::scope_for(tool);
+        self.config
+            .active_projects
+            .get(scope)
+            .cloned()
+            .or_else(|| {
+                if scope == "claude" {
+                    self.config.active_project.clone()
+                } else {
+                    None
+                }
+            })
+    }
+
+    /// 列出项目快照名（排序）。
+    pub fn list_projects(&self) -> Vec<String> {
+        self.config.projects.keys().cloned().collect()
+    }
+
 
     /// 删除项目快照。
     pub fn delete_project(&mut self, name: &str) -> Result<()> {
@@ -582,8 +775,22 @@ impl Store {
         self.save()
     }
 
-    /// 登录托管账号：标记登录并生成托管供应商（路由模式）。
-    pub fn login_account(&mut self, id: &str, name: &str) -> Result<()> {
+    /// 登录托管账号：标记登录、保存真实 OAuth token 到工具凭据文件、生成托管供应商。
+    ///
+    /// `provider` 为 OAuth provider（`xai`/`codex`）；`token` 为 OAuth access_token。
+    /// 凭据写入：Codex `~/.codex/auth.json`（`tokens.access_token`）、
+    /// xAI `~/.xai/credentials.json`（`access_token`）。
+    pub fn login_account(
+        &mut self,
+        id: &str,
+        name: &str,
+        provider: &str,
+        token: &str,
+    ) -> Result<()> {
+        // 保存真实 token 到工具凭据文件（OAuth 登录成功后的持久化）。
+        if let Err(e) = save_oauth_token(provider, token) {
+            eprintln!("OAuth token 保存警告: {e}");
+        }
         let pid = format!("hosted-{id}");
         if !self.config.providers.contains_key(&pid) {
             let mut p = Provider::with_id(
@@ -649,11 +856,124 @@ impl Store {
         self.save()
     }
 
+    /// 切换共享 `~/.agents/skills` 目录（保存）。
+    pub fn set_shared_skills(&mut self, shared: bool) -> Result<()> {
+        self.config.settings.shared_skills = shared;
+        self.save()
+    }
+
+    /// 记录首次运行欢迎页已关闭（保存）。
+    pub fn set_welcome_dismissed(&mut self, dismissed: bool) -> Result<()> {
+        self.config.settings.welcome_dismissed = dismissed;
+        self.save()
+    }
+
+    /// 记录本次启动看到的版本（WhatsNew 检测用）。
+    pub fn set_last_seen_version(&mut self, v: &str) -> Result<()> {
+        self.config.settings.last_seen_version = v.to_string();
+        self.save()
+    }
+
+    /// 设置全局出站代理（保存；空 = 直连）。
+    pub fn set_global_proxy(&mut self, url: &str) -> Result<()> {
+        self.config.settings.set_global_proxy(url);
+        self.save()
+    }
+
+    /// 设置某工具配置目录覆盖（保存；空 = 恢复默认）。
+    pub fn set_config_dir(&mut self, tool: Tool, dir: &str) -> Result<()> {
+        self.config.settings.set_config_dir(tool, dir);
+        self.save()
+    }
+
+    /// 设置自定义模型定价（保存）。
+    pub fn set_custom_price(
+        &mut self,
+        model: &str,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        cache_read_per_mtok: Option<f64>,
+    ) -> Result<()> {
+        self.config
+            .settings
+            .set_custom_price(model, input_per_mtok, output_per_mtok, cache_read_per_mtok);
+        self.save()
+    }
+
+    /// 删除自定义模型定价（保存）。
+    pub fn remove_custom_price(&mut self, model: &str) -> Result<()> {
+        self.config.settings.remove_custom_price(model);
+        self.save()
+    }
+
+    /// 某工具是否在侧栏显示（默认显示）。
+    pub fn tool_visible(&self, tool: Tool) -> bool {
+        self.config
+            .settings
+            .visible_apps
+            .get(tool.id_str())
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// 设置工具可见性并保存。
+    pub fn set_tool_visible(&mut self, tool: Tool, visible: bool) -> Result<()> {
+        self.config
+            .settings
+            .visible_apps
+            .insert(tool.id_str().to_string(), visible);
+        self.save()
+    }
+
+    /// 侧栏工具顺序：按 `app_order` 优先，未记录者按 `Tool::ALL` 顺序追加。
+    pub fn tool_order(&self) -> Vec<Tool> {
+        let order = &self.config.settings.app_order;
+        let mut out: Vec<Tool> = Vec::new();
+        for id in order {
+            if let Some(t) = Tool::ALL.iter().find(|t| t.id_str() == id) {
+                if !out.contains(t) {
+                    out.push(*t);
+                }
+            }
+        }
+        for t in Tool::ALL {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// 保存侧栏工具顺序。
+    pub fn set_tool_order(&mut self, order: &[Tool]) -> Result<()> {
+        self.config.settings.app_order = order.iter().map(|t| t.id_str().to_string()).collect();
+        self.save()
+    }
+
+    /// 在侧栏把工具移动到目标索引（-1 = 移到最前）。
+    pub fn move_tool(&mut self, tool: Tool, target: isize) -> Result<()> {
+        let mut order = self.tool_order();
+        if let Some(pos) = order.iter().position(|&t| t == tool) {
+            let t = order.remove(pos);
+            let idx = (target.max(0) as usize).min(order.len());
+            order.insert(idx, t);
+            self.set_tool_order(&order)?;
+        }
+        Ok(())
+    }
+
+
     /// 推送 config.json 到 WebDAV（`PUT {url}/config.json`）。
     pub fn sync_push(&self) -> Result<()> {
         let cfg = &self.config.settings.sync;
-        if cfg.provider != "webdav" || cfg.url.is_empty() {
-            bail!("仅支持 WebDAV 推送（请在设置配置 URL）");
+        if cfg.url.is_empty() {
+            bail!("请先在设置配置同步 URL");
+        }
+        if cfg.provider == "s3" {
+            return self.s3_push(cfg);
+        }
+        if cfg.provider != "webdav" {
+            bail!("仅支持 WebDAV / S3 推送");
         }
         let url = format!("{}/config.json", cfg.url.trim_end_matches('/'));
         let out = std::process::Command::new("curl")
@@ -677,28 +997,368 @@ impl Store {
         }
     }
 
-    /// 从 WebDAV 拉取 config.json 并应用。
-    pub fn sync_pull(&mut self) -> Result<()> {
-        let cfg = self.config.settings.sync.clone();
-        if cfg.provider != "webdav" || cfg.url.is_empty() {
-            bail!("仅支持 WebDAV 拉取（请在设置配置 URL）");
+    /// S3 PUT `config.json`（SigV4 签名）。
+    fn s3_push(&self, cfg: &SyncConfig) -> Result<()> {
+        if cfg.bucket.is_empty() || cfg.username.is_empty() || cfg.password.is_empty() {
+            bail!("S3 需配置 bucket、Access Key、Secret Key");
         }
-        let url = format!("{}/config.json", cfg.url.trim_end_matches('/'));
+        let body = fs::read_to_string(&self.config_path)
+            .with_context(|| format!("读配置失败: {}", self.config_path.display()))?;
+        let (amz_date, _date) = aws_now();
+        let payload_hash = hex::encode(sha2::Sha256::digest(body.as_bytes()));
+        let url = s3_object_url(&cfg.url, &cfg.bucket, "config.json");
+        let host = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let path = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .find('/')
+            .map(|i| &url[url.find("://").map(|j| j + 3).unwrap_or(0) + i..])
+            .unwrap_or("/")
+            .to_string();
+        let auth = aws_sigv4(
+            "PUT",
+            &host,
+            &path,
+            &cfg.username,
+            &cfg.password,
+            &s3_region(&cfg.url),
+            &payload_hash,
+            &amz_date,
+        );
         let out = std::process::Command::new("curl")
             .arg("-sS")
-            .arg("-u")
-            .arg(format!("{}:{}", cfg.username, cfg.password))
+            .arg("-o")
+            .arg("/dev/null")
+            .arg("-w")
+            .arg("%{http_code}")
+            .arg("-X")
+            .arg("PUT")
+            .arg("-H")
+            .arg(format!("Authorization: {auth}"))
+            .arg("-H")
+            .arg(format!("x-amz-date: {amz_date}"))
+            .arg("-H")
+            .arg(format!("x-amz-content-sha256: {payload_hash}"))
+            .arg("--data-binary")
+            .arg(&body)
             .arg(&url)
             .output()
             .map_err(|e| anyhow::anyhow!("curl 执行失败: {e}"))?;
-        if !out.status.success() {
-            bail!("WebDAV 拉取失败: HTTP {}", out.status);
+        let code = String::from_utf8_lossy(&out.stdout);
+        if code.starts_with('2') {
+            Ok(())
+        } else {
+            bail!("S3 推送失败: HTTP {code}")
         }
-        let remote: Config = serde_json::from_slice(&out.stdout)
-            .map_err(|e| anyhow::anyhow!("远端 config 解析失败: {e}"))?;
+    }
+
+
+    /// 从 WebDAV 拉取 config.json 并应用。
+    pub fn sync_pull(&mut self) -> Result<()> {
+        let cfg = self.config.settings.sync.clone();
+        if cfg.url.is_empty() {
+            bail!("请先在设置配置同步 URL");
+        }
+        let remote: Config = if cfg.provider == "s3" {
+            if cfg.bucket.is_empty() || cfg.username.is_empty() || cfg.password.is_empty() {
+                bail!("S3 需配置 bucket、Access Key、Secret Key");
+            }
+            let (amz_date, _date) = aws_now();
+            let payload_hash = hex::encode(sha2::Sha256::digest(b""));
+            let url = s3_object_url(&cfg.url, &cfg.bucket, "config.json");
+            let host = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let scheme_len = url.find("://").map(|j| j + 3).unwrap_or(0);
+            let path = url[scheme_len..]
+                .find('/')
+                .map(|i| url[scheme_len + i..].to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let auth = aws_sigv4(
+                "GET",
+                &host,
+                &path,
+                &cfg.username,
+                &cfg.password,
+                &s3_region(&cfg.url),
+                &payload_hash,
+                &amz_date,
+            );
+            let out = std::process::Command::new("curl")
+                .arg("-sS")
+                .arg("-H")
+                .arg(format!("Authorization: {auth}"))
+                .arg("-H")
+                .arg(format!("x-amz-date: {amz_date}"))
+                .arg("-H")
+                .arg(format!("x-amz-content-sha256: {payload_hash}"))
+                .arg(&url)
+                .output()
+                .map_err(|e| anyhow::anyhow!("curl 执行失败: {e}"))?;
+            if !out.status.success() {
+                bail!("S3 拉取失败: HTTP {}", out.status);
+            }
+            serde_json::from_slice(&out.stdout)
+                .map_err(|e| anyhow::anyhow!("远端 config 解析失败: {e}"))?
+        } else {
+            if cfg.provider != "webdav" {
+                bail!("仅支持 WebDAV / S3 拉取");
+            }
+            let url = format!("{}/config.json", cfg.url.trim_end_matches('/'));
+            let out = std::process::Command::new("curl")
+                .arg("-sS")
+                .arg("-u")
+                .arg(format!("{}:{}", cfg.username, cfg.password))
+                .arg(&url)
+                .output()
+                .map_err(|e| anyhow::anyhow!("curl 执行失败: {e}"))?;
+            if !out.status.success() {
+                bail!("WebDAV 拉取失败: HTTP {}", out.status);
+            }
+            serde_json::from_slice(&out.stdout)
+                .map_err(|e| anyhow::anyhow!("远端 config 解析失败: {e}"))?
+        };
+        // 冲突处理：覆盖前自动备份本地 config（避免丢失本地修改）。
+        backup_sync_conflict(&self.config_path, &self.config);
         self.config = remote;
         self.save()
     }
+
+}
+
+/// 同步冲突备份：本地 config 与远端不同时，备份本地到 `backups/sync/`。
+///
+/// 返回是否创建了备份（纯函数，便于单测）。
+fn backup_sync_conflict(config_path: &Path, local: &Config) -> bool {
+    let Ok(local_raw) = fs::read_to_string(config_path) else {
+        return false;
+    };
+    let remote_raw = serde_json::to_string_pretty(local).unwrap_or_default();
+    if local_raw.trim() == remote_raw.trim() {
+        return false;
+    }
+    let backup_dir = config_path
+        .parent()
+        .map(|p| p.join("backups").join("sync"))
+        .unwrap_or_else(|| PathBuf::from("backups/sync"));
+    if fs::create_dir_all(&backup_dir).is_err() {
+        return false;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = backup_dir.join(format!("config-{ts}.json"));
+    fs::write(&backup, &local_raw).is_ok()
+}
+
+/// 保存 OAuth token 到工具凭据文件（OAuth 登录成功后的持久化）。
+///
+/// - `codex`：`~/.codex/auth.json` 的 `tokens.access_token`（保留其他字段）。
+/// - `xai`：`~/.xai/credentials.json` 的 `access_token`。
+/// 其他 provider 暂不落盘（返回 Ok，避免阻塞登录）。
+fn save_oauth_token(provider: &str, token: &str) -> Result<()> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(());
+    };
+    match provider {
+        "codex" => {
+            let path = home.join(".codex").join("auth.json");
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut v: Value = if path.exists() {
+                fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(Value::Object(Default::default()))
+            } else {
+                Value::Object(Default::default())
+            };
+            let obj = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("auth.json 非对象"))?;
+            let tokens = obj
+                .entry("tokens")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(t) = tokens.as_object_mut() {
+                t.insert("access_token".into(), Value::String(token.to_string()));
+            }
+            fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+            Ok(())
+        }
+        "xai" => {
+            let path = home.join(".xai").join("credentials.json");
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let v = serde_json::json!({ "access_token": token });
+            fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+            Ok(())
+        }
+        "copilot" => {
+            let path = home.join(".config").join("github-copilot").join("hosts.json");
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut v: Value = if path.exists() {
+                fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(Value::Object(Default::default()))
+            } else {
+                Value::Object(Default::default())
+            };
+            let obj = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("hosts.json 非对象"))?;
+            let host = obj
+                .entry("github.com")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Some(h) = host.as_object_mut() {
+                h.insert("oauth_token".into(), Value::String(token.to_string()));
+            }
+            fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod sync_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn backup_created_when_local_differs() {
+        let dir = std::env::temp_dir().join("ns-sync-conflict-test");
+        let _ = fs::create_dir_all(&dir);
+        let cfg_path = dir.join("config.json");
+        // 本地内容 A，远端（当前 config 序列化）内容 B。
+        fs::write(&cfg_path, r#"{"providers":{}}"#).unwrap();
+        let mut remote = Config::default();
+        remote.settings.shared_skills = true;
+        let created = backup_sync_conflict(&cfg_path, &remote);
+        assert!(created, "本地与远端不同应创建备份");
+        let backups = fs::read_dir(dir.join("backups").join("sync")).unwrap().count();
+        assert_eq!(backups, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_backup_when_identical() {
+        let dir = std::env::temp_dir().join("ns-sync-conflict-same-test");
+        let _ = fs::create_dir_all(&dir);
+        let cfg_path = dir.join("config.json");
+        let local = Config::default();
+        let raw = serde_json::to_string_pretty(&local).unwrap();
+        fs::write(&cfg_path, &raw).unwrap();
+        let created = backup_sync_conflict(&cfg_path, &local);
+        assert!(!created, "本地与远端相同不应备份");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// AWS Signature V4 签名（S3 PUT/GET 用）。
+fn aws_sigv4(
+    method: &str,
+    host: &str,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    payload_hash: &str,
+    amz_date: &str,
+) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    type HmacSha256 = Hmac<Sha256>;
+
+    let service = "s3";
+    let canonical_uri = if path.is_empty() { "/" } else { path };
+    let canonical_query = "";
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers = format!(
+        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
+    );
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+    let scope = format!("{}/{region}/{service}/aws4_request", &amz_date[..8]);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let mut k = HmacSha256::new_from_slice(format!("AWS4{secret_key}").as_bytes()).unwrap();
+    k.update(amz_date.as_bytes());
+    let k_date = k.finalize().into_bytes();
+    let mut k = HmacSha256::new_from_slice(&k_date).unwrap();
+    k.update(region.as_bytes());
+    let k_region = k.finalize().into_bytes();
+    let mut k = HmacSha256::new_from_slice(&k_region).unwrap();
+    k.update(service.as_bytes());
+    let k_service = k.finalize().into_bytes();
+    let mut k = HmacSha256::new_from_slice(&k_service).unwrap();
+    k.update(b"aws4_request");
+    let k_signing = k.finalize().into_bytes();
+    let mut k = HmacSha256::new_from_slice(&k_signing).unwrap();
+    k.update(string_to_sign.as_bytes());
+    let signature = hex::encode(k.finalize().into_bytes());
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    )
+}
+
+/// 从 epoch 秒转 UTC (amz_date, date)（Howard Hinnant 算法）。
+fn aws_now() -> (String, String) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs.div_euclid(86400);
+    let day_secs = secs.rem_euclid(86400);
+    let (y, m, d) = civil_from_days(days);
+    let hh = day_secs / 3600;
+    let mm = (day_secs % 3600) / 60;
+    let ss = day_secs % 60;
+    (
+        format!("{y:04}{m:02}{d:02}T{hh:02}{mm:02}{ss:02}Z"),
+        format!("{y:04}{m:02}{d:02}"),
+    )
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// S3 对象 URL（`{endpoint}/{bucket}/{key}`）。
+fn s3_object_url(endpoint: &str, bucket: &str, key: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        endpoint.trim_end_matches('/'),
+        bucket.trim_start_matches('/').trim_end_matches('/'),
+        key.trim_start_matches('/')
+    )
+}
+
+/// 从 S3 endpoint 推断 region（无显式 region 时默认 us-east-1）。
+fn s3_region(_endpoint: &str) -> String {
+    "us-east-1".to_string()
 }
 
 /// 默认数据目录。
@@ -791,6 +1451,29 @@ mod tests {
         assert!(store.config().providers.is_empty());
         assert_eq!(store.config().settings.theme, "dark");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn routing_config_breaker_defaults_and_serde() {
+        // 默认熔断参数（向后兼容旧 config 缺失字段）。
+        let rc = RoutingConfig::default();
+        assert_eq!(rc.breaker_threshold, 3);
+        assert_eq!(rc.breaker_cooldown, 30);
+        // 旧 config 无 breaker 字段 → 反序列化回退默认。
+        let rc: RoutingConfig = serde_json::from_str(
+            r#"{"enabled":false,"port":0,"listen_addr":"127.0.0.1","failover":false}"#,
+        )
+        .unwrap();
+        assert_eq!(rc.breaker_threshold, 3);
+        assert_eq!(rc.breaker_cooldown, 30);
+        // 显式值往返。
+        let mut rc = RoutingConfig::default();
+        rc.breaker_threshold = 5;
+        rc.breaker_cooldown = 60;
+        let json = serde_json::to_string(&rc).unwrap();
+        let back: RoutingConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.breaker_threshold, 5);
+        assert_eq!(back.breaker_cooldown, 60);
     }
 
     #[test]
@@ -964,13 +1647,17 @@ mod tests {
             store.add_provider(sample_provider("p1")).unwrap();
             store.add_provider(sample_provider("p2")).unwrap();
             store.set_current(Tool::Claude, "p1".into()).unwrap();
-            store.save_project("工作").unwrap();
+            store
+                .save_project("工作", "claude", &Default::default())
+                .unwrap();
             store.set_current(Tool::Claude, "p2".into()).unwrap();
             assert_eq!(
                 store.config().current.get(Tool::Claude).map(String::as_str),
                 Some("p2")
             );
-            store.apply_project("工作").unwrap();
+            store
+                .apply_project("工作", "claude", &Default::default())
+                .unwrap();
             assert_eq!(
                 store.config().current.get(Tool::Claude).map(String::as_str),
                 Some("p1")
@@ -986,15 +1673,34 @@ mod tests {
     fn hosted_account_creates_provider() {
         let dir = test_dir();
         {
-            let mut store = Store::open_at(dir.clone()).unwrap();
-            store.login_account("copilot", "GitHub Copilot").unwrap();
-            assert!(store.config().accounts.contains_key("copilot"));
-            assert!(store.config().providers.contains_key("hosted-copilot"));
-            assert!(store.config().accounts["copilot"].logged_in);
-            store.logout_account("copilot").unwrap();
-            assert!(!store.config().accounts["copilot"].logged_in);
-            // 供应商保留。
-            assert!(store.config().providers.contains_key("hosted-copilot"));
+            // 临时 HOME：避免污染真实凭据文件。
+            let home = dir.join("home");
+            fs::create_dir_all(&home).unwrap();
+            let old_home = std::env::var_os("HOME");
+            // 临时 HOME 切换（edition 2024：set_var unsafe）。
+            unsafe { std::env::set_var("HOME", &home) };
+            {
+                let mut store = Store::open_at(dir.clone()).unwrap();
+                store
+                    .login_account("copilot", "GitHub Copilot", "copilot", "gho_test_token")
+                    .unwrap();
+                assert!(store.config().accounts.contains_key("copilot"));
+                assert!(store.config().providers.contains_key("hosted-copilot"));
+                assert!(store.config().accounts["copilot"].logged_in);
+                // token 落盘到临时 HOME。
+                let hosts = home.join(".config/github-copilot/hosts.json");
+                assert!(hosts.exists(), "hosts.json 应写入");
+                let raw = fs::read_to_string(&hosts).unwrap();
+                assert!(raw.contains("gho_test_token"));
+                store.logout_account("copilot").unwrap();
+                assert!(!store.config().accounts["copilot"].logged_in);
+                // 供应商保留。
+                assert!(store.config().providers.contains_key("hosted-copilot"));
+            }
+            match old_home {
+                Some(h) => unsafe { std::env::set_var("HOME", h) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
         }
         let _ = fs::remove_dir_all(dir);
     }
@@ -1037,6 +1743,7 @@ mod tests {
                     password: "p".into(),
                     bucket: String::new(),
                     enabled: true,
+                    auto_sync_minutes: 30,
                 })
                 .unwrap();
             assert_eq!(store.config().settings.sync.provider, "webdav");
@@ -1149,5 +1856,94 @@ mod tests {
         }
         let _ = fs::remove_dir_all(dir);
     }
-}
+    #[test]
+    fn custom_pricing_roundtrip() {
+        let dir = test_dir();
+        {
+            let mut store = Store::open_at(dir.clone()).unwrap();
+            store
+                .set_custom_price("claude-sonnet-4-5", 3.0, 15.0, Some(0.3))
+                .unwrap();
+            store
+                .set_custom_price("grok-3", 2.0, 10.0, None)
+                .unwrap();
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        let p = store.config().settings.custom_pricing.clone();
+        let sonnet = p.get("claude-sonnet-4-5").expect("sonnet priced");
+        assert_eq!(sonnet.get("input_per_mtok").and_then(|x| x.as_f64()), Some(3.0));
+        assert_eq!(sonnet.get("output_per_mtok").and_then(|x| x.as_f64()), Some(15.0));
+        assert_eq!(sonnet.get("cache_read_per_mtok").and_then(|x| x.as_f64()), Some(0.3));
+        let grok = p.get("grok-3").expect("grok priced");
+        assert_eq!(grok.get("cache_read_per_mtok").and_then(|x| x.as_f64()), None);
+        let _ = fs::remove_dir_all(dir);
+    }
 
+    #[test]
+    fn sigv4_signature_format_and_aws_now() {
+        // 已知 AWS 文档示例：GET /us-east-1/aws4_request 签名格式。
+        let auth = aws_sigv4(
+            "GET",
+            "example.com",
+            "/bucket/config.json",
+            "AKID",
+            "SECRET",
+            "us-east-1",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "20260101T000000Z",
+        );
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request"), "凭据前缀: {auth}");
+        assert!(auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"), "签名头: {auth}");
+        assert!(auth.contains("Signature="), "签名存在: {auth}");
+
+        let (amz, date) = aws_now();
+        assert_eq!(amz.len(), 16, "amz_date 应为 yyyymmddTHHMMSSZ");
+        assert!(amz.ends_with('Z'));
+        assert_eq!(date.len(), 8, "date 应为 yyyymmdd");
+        // 日期合理性：2026 年内。
+        let y: i32 = date[..4].parse().unwrap();
+        assert!((2020..2030).contains(&y), "年份合理: {y}");
+
+        // civil_from_days 已知值：epoch day 0 = 1970-01-01。
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2026-11-10 是已知日期；用 aws_now 一致性验证（非负天数）。
+        let (y2, m2, d2) = civil_from_days(20700);
+        assert!(y2 >= 2026, "天 20700 应近 2026: {y2}-{m2}-{d2}");
+        assert!((1..=12).contains(&m2));
+        assert!((1..=31).contains(&d2));
+
+        // S3 对象 URL。
+        assert_eq!(
+            s3_object_url("https://s3.example.com", "my-bucket", "config.json"),
+            "https://s3.example.com/my-bucket/config.json"
+        );
+    }
+
+    #[test]
+    fn config_dir_override_roundtrip() {
+        let dir = test_dir();
+        {
+            let mut store = Store::open_at(dir.clone()).unwrap();
+            store.set_config_dir(Tool::Claude, "/custom/claude").unwrap();
+            store.set_config_dir(Tool::Codex, "").unwrap(); // 清除
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store.config().settings.config_dir_for(Tool::Claude),
+            Some("/custom/claude")
+        );
+        assert_eq!(store.config().settings.config_dir_for(Tool::Codex), None);
+        assert_eq!(store.config().settings.config_dir_for(Tool::Gemini), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_dir_serde_roundtrip() {
+        let mut s = Settings::default();
+        s.set_config_dir(Tool::GrokBuild, "/srv/grok");
+        let v = serde_json::to_value(&s).unwrap();
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(back.config_dir_for(Tool::GrokBuild), Some("/srv/grok"));
+    }
+
+}

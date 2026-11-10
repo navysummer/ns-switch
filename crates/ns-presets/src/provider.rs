@@ -79,6 +79,18 @@ pub struct ProviderMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "apiFormat")]
     pub api_format: Option<String>,
+    /// 是否启用用量查询（None/true = 启用；false = 卡片不显示配额脚注）。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(rename = "usageEnabled")]
+    pub usage_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Default for ProviderMeta {
@@ -89,6 +101,7 @@ impl Default for ProviderMeta {
             models: None,
             usage_script: None,
             api_format: None,
+            usage_enabled: true,
         }
     }
 }
@@ -510,5 +523,26 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["slug"], "claude-sonnet-4-5");
         assert_eq!(models[1]["slug"], "gpt-6-sol");
+    }
+
+    #[test]
+    fn provider_meta_usage_enabled_serde() {
+        // 默认启用；显式停用时序列化 usageEnabled:false。
+        let meta = ProviderMeta::default();
+        assert!(meta.usage_enabled);
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("usageEnabled"));
+        let disabled = ProviderMeta {
+            usage_enabled: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&disabled).unwrap();
+        assert!(json.contains("usageEnabled"));
+        assert!(json.contains("false"));
+        let back: ProviderMeta = serde_json::from_str(&json).unwrap();
+        assert!(!back.usage_enabled);
+        // 缺失字段回退为 true（向后兼容旧 config）。
+        let back: ProviderMeta = serde_json::from_str("{}").unwrap();
+        assert!(back.usage_enabled);
     }
 }
