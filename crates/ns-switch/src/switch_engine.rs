@@ -38,34 +38,66 @@ impl LivePatch for Patch {
     }
 }
 
-/// 客户端 live 配置文件目录（`~`）。
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+
+/// 配置目录覆盖表（key = 工具 `id_str()`，value = 绝对路径）。
+pub type ConfigDirs = std::collections::BTreeMap<String, String>;
+
+/// 某工具的配置基础目录（用户覆盖优先，否则 `home` 默认）。
+fn tool_base_dir(
+    tool: Tool,
+    home: &std::path::Path,
+    config_dirs: &ConfigDirs,
+) -> std::path::PathBuf {
+    if let Some(d) = config_dirs
+        .get(tool.id_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return std::path::PathBuf::from(d);
+    }
+    match tool {
+        Tool::Claude => home.join(".claude"),
+        Tool::Codex => home.join(".codex"),
+        Tool::Gemini => home.join(".gemini"),
+        Tool::GrokBuild => home.join(".grok"),
+        Tool::Opencode => home.join(".config").join("opencode"),
+        Tool::Openclaw => home.join(".openclaw"),
+        Tool::Pi => home.join(".pi").join("agent"),
+        Tool::Hermes => home.join(".hermes"),
+        Tool::Mcode => home.join(".minimax"),
+        Tool::Kimi => home.join(".kimi-code"),
+        Tool::Omp => home.join(".omp").join("agent"),
+        Tool::Agy => home.join(".agy"),
+        _ => home.join(format!(".{}", tool.id_str())),
+    }
 }
 
 /// 指定家目录的 live 计划（测试可用临时目录）。
-pub fn plan_for_tool_in(tool: Tool, provider: &Provider, home: &std::path::Path) -> Vec<LivePlan> {
+pub fn plan_for_tool_in(
+    tool: Tool,
+    provider: &Provider,
+    home: &std::path::Path,
+    config_dirs: &ConfigDirs,
+) -> Vec<LivePlan> {
     let cfg = &provider.settings_config;
+    let dir = tool_base_dir(tool, home, config_dirs);
     match tool {
         Tool::Claude => vec![LivePlan {
-            file: LiveFile::new("claude", home.join(".claude").join("settings.json"), true),
+            file: LiveFile::new("claude", dir.join("settings.json"), true),
             patch: Patch::Json(claude_patch(cfg)),
         }],
         Tool::Codex => vec![LivePlan {
-            file: LiveFile::new("codex", home.join(".codex").join("config.toml"), true),
+            file: LiveFile::new("codex", dir.join("config.toml"), true),
             patch: Patch::Toml(codex_patch(cfg)),
         }],
         Tool::Gemini => {
             let mut plans = vec![LivePlan {
-                file: LiveFile::new("gemini", home.join(".gemini").join("settings.json"), true),
+                file: LiveFile::new("gemini", dir.join("settings.json"), true),
                 patch: Patch::Json(gemini_settings_patch(cfg)),
             }];
             let entries = gemini_env_entries(cfg);
             if !entries.is_empty() {
                 plans.push(LivePlan {
-                    file: LiveFile::new("gemini", home.join(".gemini").join(".env"), true),
+                    file: LiveFile::new("gemini", dir.join(".env"), true),
                     patch: Patch::Env(EnvPatch {
                         remove: vec![],
                         set: entries,
@@ -77,37 +109,37 @@ pub fn plan_for_tool_in(tool: Tool, provider: &Provider, home: &std::path::Path)
         Tool::GrokBuild => {
             let id = provider.id.clone();
             vec![LivePlan {
-                file: LiveFile::new("grok", home.join(".grok").join("config.toml"), true),
+                file: LiveFile::new("grok", dir.join("config.toml"), true),
                 patch: Patch::Toml(ns_live::grok_patch(&id, cfg)),
             }]
         }
         // 共存式工具（additive）：把供应商 upsert 进工具自身配置。
         Tool::Opencode => vec![LivePlan {
-            file: LiveFile::new("opencode", home.join(".config").join("opencode").join("opencode.json"), true),
+            file: LiveFile::new("opencode", dir.join("opencode.json"), true),
             patch: Patch::Json(ns_live::opencode_patch(&provider.id, cfg)),
         }],
         Tool::Openclaw => vec![LivePlan {
-            file: LiveFile::new("openclaw", home.join(".openclaw").join("openclaw.json"), true),
+            file: LiveFile::new("openclaw", dir.join("openclaw.json"), true),
             patch: Patch::Json(ns_live::openclaw_patch(&provider.id, cfg)),
         }],
         Tool::Pi => vec![LivePlan {
-            file: LiveFile::new("pi", home.join(".pi").join("agent").join("models.json"), true),
+            file: LiveFile::new("pi", dir.join("models.json"), true),
             patch: Patch::Json(ns_live::pi_patch(&provider.id, cfg)),
         }],
         Tool::Hermes => vec![LivePlan {
-            file: LiveFile::new("hermes", home.join(".hermes").join("config.yaml"), true),
+            file: LiveFile::new("hermes", dir.join("config.yaml"), true),
             patch: Patch::Yaml(ns_live::hermes_patch(&provider.id, cfg)),
         }],
         Tool::Mcode => vec![LivePlan {
-            file: LiveFile::new("mcode", home.join(".minimax").join("config.yaml"), true),
+            file: LiveFile::new("mcode", dir.join("config.yaml"), true),
             patch: Patch::Yaml(ns_live::mcode_patch(&provider.id, cfg)),
         }],
         Tool::Kimi => vec![LivePlan {
-            file: LiveFile::new("kimi", home.join(".kimi-code").join("config.toml"), true),
+            file: LiveFile::new("kimi", dir.join("config.toml"), true),
             patch: Patch::Toml(ns_live::kimi_patch(&provider.id, cfg)),
         }],
         Tool::Omp => vec![LivePlan {
-            file: LiveFile::new("omp", home.join(".omp").join("agent").join("models.yml"), true),
+            file: LiveFile::new("omp", dir.join("models.yml"), true),
             patch: Patch::Yaml(ns_live::omp_patch(&provider.id, cfg)),
         }],
         // Agy 卡只开终端，不写 live 文件。
@@ -123,32 +155,34 @@ pub fn routing_plans_for_tool_in(
     tool: Tool,
     port: u16,
     home: &std::path::Path,
+    config_dirs: &ConfigDirs,
 ) -> Vec<LivePlan> {
     use ns_live::{
         claude_routing_patch, codex_routing_patch, gemini_routing_env_patch,
         gemini_routing_settings_patch,
     };
+    let dir = tool_base_dir(tool, home, config_dirs);
     match tool {
         Tool::Claude => vec![LivePlan {
-            file: LiveFile::new("claude", home.join(".claude").join("settings.json"), true),
+            file: LiveFile::new("claude", dir.join("settings.json"), true),
             patch: Patch::Json(claude_routing_patch(port)),
         }],
         Tool::Codex => vec![LivePlan {
-            file: LiveFile::new("codex", home.join(".codex").join("config.toml"), true),
+            file: LiveFile::new("codex", dir.join("config.toml"), true),
             patch: Patch::Toml(codex_routing_patch(port)),
         }],
         Tool::Gemini => vec![
             LivePlan {
-                file: LiveFile::new("gemini", home.join(".gemini").join("settings.json"), true),
+                file: LiveFile::new("gemini", dir.join("settings.json"), true),
                 patch: Patch::Json(gemini_routing_settings_patch(port)),
             },
             LivePlan {
-                file: LiveFile::new("gemini", home.join(".gemini").join(".env"), true),
+                file: LiveFile::new("gemini", dir.join(".env"), true),
                 patch: Patch::Env(gemini_routing_env_patch(port)),
             },
         ],
         Tool::GrokBuild => vec![LivePlan {
-            file: LiveFile::new("grok", home.join(".grok").join("config.toml"), true),
+            file: LiveFile::new("grok", dir.join("config.toml"), true),
             patch: Patch::Toml(ns_live::grok_routing_patch("grok-routing", port)),
         }],
         _ => Vec::new(),
@@ -156,13 +190,15 @@ pub fn routing_plans_for_tool_in(
 }
 
 /// 写入路由模式 live 配置（指向本地代理）。返回写入文件数。
-pub fn switch_to_routing_in(
+/// 指定家目录 + 配置目录覆盖的路由切换（测试/设置覆盖用）。
+pub fn switch_to_routing_in_dirs(
     tool: Tool,
     port: u16,
     backup_dir: &std::path::Path,
     home: &std::path::Path,
+    config_dirs: &ConfigDirs,
 ) -> Result<SwitchOutcome, LiveWriteError> {
-    let plans = routing_plans_for_tool_in(tool, port, home);
+    let plans = routing_plans_for_tool_in(tool, port, home, config_dirs);
     if plans.is_empty() {
         return Ok(SwitchOutcome {
             written: 0,
@@ -204,16 +240,18 @@ pub struct Conflict {
 /// - 当前无激活供应商 → 文件非空视为手动占用冲突。
 /// - 有激活供应商 B（≠ 目标 A）→ 磁盘内容与 B 的预期写入一致 ⇒ 正常切换；
 ///   不一致 ⇒ 手动改动/被其他进程占用 ⇒ 冲突。
-pub fn check_conflicts(
+/// 指定家目录 + 配置目录覆盖的冲突检测。
+pub fn check_conflicts_dirs(
     tool: Tool,
     target: &Provider,
     current_provider: Option<&Provider>,
     home: &std::path::Path,
+    config_dirs: &ConfigDirs,
 ) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
-    let target_plans = plan_for_tool_in(tool, target, home);
+    let target_plans = plan_for_tool_in(tool, target, home, config_dirs);
     // 当前激活供应商的预期内容（用于「磁盘是否等于 B 的写入」判断）。
-    let current_plans = current_provider.map(|p| plan_for_tool_in(tool, p, home));
+    let current_plans = current_provider.map(|p| plan_for_tool_in(tool, p, home, config_dirs));
     for plan in &target_plans {
         let Some(pre) = ns_live::read_current(&plan.file.path).ok().flatten() else {
             continue; // 文件不存在：无冲突
@@ -248,22 +286,16 @@ pub struct SwitchOutcome {
     /// 是否为 noop（内容与现有一致）。
     pub noop: bool,
 }
-pub fn switch_to(
-    tool: Tool,
-    provider: &Provider,
-    backup_dir: &std::path::Path,
-) -> Result<SwitchOutcome, LiveWriteError> {
-    switch_to_in(tool, provider, backup_dir, &home())
-}
-
 /// 指定家目录的切换（测试用临时目录）。
-pub fn switch_to_in(
+/// 指定家目录 + 配置目录覆盖的切换。
+pub fn switch_to_in_dirs(
     tool: Tool,
     provider: &Provider,
     backup_dir: &std::path::Path,
     home: &std::path::Path,
+    config_dirs: &ConfigDirs,
 ) -> Result<SwitchOutcome, LiveWriteError> {
-    let plans = plan_for_tool_in(tool, provider, home);
+    let plans = plan_for_tool_in(tool, provider, home, config_dirs);
     if plans.is_empty() {
         return Ok(SwitchOutcome {
             written: 0,
@@ -315,10 +347,24 @@ mod tests {
     #[test]
     fn claude_plan_writes_settings_json() {
         let home = std::env::temp_dir().join(format!("ns-switch-plan-{}", std::process::id()));
-        let plans = plan_for_tool_in(Tool::Claude, &claude_provider(), &home);
+        let plans = plan_for_tool_in(Tool::Claude, &claude_provider(), &home, &ConfigDirs::new());
         assert_eq!(plans.len(), 1);
         assert!(plans[0].file.path.ends_with("settings.json"));
         assert_eq!(plans[0].file.app, "claude");
+    }
+
+    #[test]
+    fn config_dir_override_moves_plan_path() {
+        let home = std::env::temp_dir().join("ns-switch-plan-override");
+        let mut dirs = ConfigDirs::new();
+        dirs.insert("claude".into(), "/custom/claude".into());
+        let plans = plan_for_tool_in(Tool::Claude, &claude_provider(), &home, &dirs);
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].file.path.starts_with("/custom/claude"), "路径应为覆盖目录: {}", plans[0].file.path.display());
+        assert!(plans[0].file.path.ends_with("settings.json"));
+        // 路由计划同样尊重覆盖。
+        let rplans = routing_plans_for_tool_in(Tool::Claude, 8899, &home, &dirs);
+        assert!(rplans[0].file.path.starts_with("/custom/claude"));
     }
 
     #[test]
@@ -335,7 +381,7 @@ mod tests {
                 }
             }),
         );
-        let plans = plan_for_tool_in(Tool::Gemini, &provider, &home);
+        let plans = plan_for_tool_in(Tool::Gemini, &provider, &home, &ConfigDirs::new());
         assert_eq!(plans.len(), 2, "settings.json + .env");
         assert!(plans[0].file.path.ends_with("settings.json"));
         assert!(plans[1].file.path.ends_with(".env"));
@@ -346,7 +392,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ns-switch-switch-{}", std::process::id()));
         let home = base.join("home");
         let backup = base.join("backups");
-        let outcome = switch_to_in(Tool::Claude, &claude_provider(), &backup, &home).unwrap();
+        let outcome = switch_to_in_dirs(Tool::Claude, &claude_provider(), &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(outcome.written, 1);
         assert!(!outcome.noop);
         let path = home.join(".claude").join("settings.json");
@@ -373,7 +419,7 @@ mod tests {
 
         // 供应商 B（88api）→ 写入并核对。
         let b = claude_provider();
-        let o1 = switch_to_in(Tool::Claude, &b, &backup, &home).unwrap();
+        let o1 = switch_to_in_dirs(Tool::Claude, &b, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o1.written, 1);
         let text1 = std::fs::read_to_string(&path).unwrap();
         assert!(text1.contains("api.88api.com"));
@@ -391,7 +437,7 @@ mod tests {
                 }
             }),
         );
-        let o2 = switch_to_in(Tool::Claude, &a, &backup, &home).unwrap();
+        let o2 = switch_to_in_dirs(Tool::Claude, &a, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o2.written, 1);
         let text2 = std::fs::read_to_string(&path).unwrap();
         assert!(text2.contains("other.example.com"));
@@ -399,7 +445,7 @@ mod tests {
         assert!(!text2.contains("api.88api.com"), "旧供应商地址应被清掉");
 
         // 重复切到 A → noop（不重写）。
-        let o3 = switch_to_in(Tool::Claude, &a, &backup, &home).unwrap();
+        let o3 = switch_to_in_dirs(Tool::Claude, &a, &backup, &home, &ConfigDirs::new()).unwrap();
         assert!(o3.noop);
         assert_eq!(o3.written, 0);
 
@@ -423,7 +469,7 @@ mod tests {
         let backup = base.join("backups");
         // 当前供应商 B 已写入磁盘。
         let b = claude_provider();
-        switch_to_in(Tool::Claude, &b, &backup, &home).unwrap();
+        switch_to_in_dirs(Tool::Claude, &b, &backup, &home, &ConfigDirs::new()).unwrap();
         // 切到 A，且 current = B：磁盘与 B 一致 ⇒ 无冲突。
         let a = Provider::with_id(
             "claude-other".into(),
@@ -436,7 +482,7 @@ mod tests {
                 }
             }),
         );
-        let conflicts = check_conflicts(Tool::Claude, &a, Some(&b), &home);
+        let conflicts = check_conflicts_dirs(Tool::Claude, &a, Some(&b), &home, &ConfigDirs::new());
         assert!(conflicts.is_empty(), "干净切换不应有冲突: {:?}", conflicts);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -447,13 +493,13 @@ mod tests {
         let home = base.join("home");
         let backup = base.join("backups");
         let b = claude_provider();
-        switch_to_in(Tool::Claude, &b, &backup, &home).unwrap();
+        switch_to_in_dirs(Tool::Claude, &b, &backup, &home, &ConfigDirs::new()).unwrap();
         // 手动改掉磁盘（模拟外部修改）。
         let settings = home.join(".claude").join("settings.json");
         std::fs::write(&settings, r#"{"env":{"ANTHROPIC_BASE_URL":"https://manual.example.com"}}"#)
             .unwrap();
         let a = claude_provider();
-        let conflicts = check_conflicts(Tool::Claude, &a, Some(&b), &home);
+        let conflicts = check_conflicts_dirs(Tool::Claude, &a, Some(&b), &home, &ConfigDirs::new());
         assert_eq!(conflicts.len(), 1, "手动改动应报冲突");
         assert!(conflicts[0].path.ends_with("settings.json"));
         let _ = std::fs::remove_dir_all(&base);
@@ -464,7 +510,7 @@ mod tests {
         let home = std::env::temp_dir().join("ns-switch-plan-none");
         let provider = claude_provider();
         // Agy 卡只开终端，不写 live 文件。
-        assert!(plan_for_tool_in(Tool::Agy, &provider, &home).is_empty());
+        assert!(plan_for_tool_in(Tool::Agy, &provider, &home, &ConfigDirs::new()).is_empty());
     }
 
     #[test]
@@ -479,7 +525,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let plans = plan_for_tool_in(Tool::Opencode, &provider, &home);
+        let plans = plan_for_tool_in(Tool::Opencode, &provider, &home, &ConfigDirs::new());
         assert_eq!(plans.len(), 1);
         assert!(plans[0].file.path.ends_with("opencode.json"));
         assert_eq!(plans[0].file.app, "opencode");
@@ -501,7 +547,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Opencode, &oc, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Opencode, &oc, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(
             home.join(".config").join("opencode").join("opencode.json"),
@@ -521,7 +567,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Openclaw, &ocw, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Openclaw, &ocw, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".openclaw").join("openclaw.json")).unwrap();
         assert!(text.contains("openclaw-88api-test"));
@@ -537,7 +583,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Hermes, &h, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Hermes, &h, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".hermes").join("config.yaml")).unwrap();
         assert!(text.contains("hermes-88api-test"));
@@ -553,7 +599,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Kimi, &k, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Kimi, &k, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".kimi-code").join("config.toml")).unwrap();
         assert!(text.contains("kimi-88api-test"));
@@ -569,7 +615,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Omp, &om, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Omp, &om, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".omp").join("agent").join("models.yml")).unwrap();
         assert!(text.contains("omp-88api-test"));
@@ -584,7 +630,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Pi, &pi, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Pi, &pi, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".pi").join("agent").join("models.json")).unwrap();
         assert!(text.contains("pi-88api-test"));
@@ -608,7 +654,7 @@ mod tests {
                 "model": "claude-sonnet-4-5",
             }),
         );
-        let o = switch_to_in(Tool::Mcode, &m, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::Mcode, &m, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".minimax").join("config.yaml")).unwrap();
         assert!(text.contains("mcode-88api-test"));
@@ -621,7 +667,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ns-switch-rs-{}", std::process::id()));
         let home = base.join("home");
         let backup = base.join("backups");
-        let _ = switch_to_routing_in(Tool::Claude, 8899, &backup, &home).unwrap();
+        let _ = switch_to_routing_in_dirs(Tool::Claude, 8899, &backup, &home, &ConfigDirs::new()).unwrap();
         // settings 里的 routing 配置经 Store 持久化。
         let dir = base.join("store");
         {
@@ -643,7 +689,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ns-switch-routing-{}", std::process::id()));
         let home = base.join("home");
         let backup = base.join("backups");
-        let outcome = switch_to_routing_in(Tool::Claude, 8899, &backup, &home).unwrap();
+        let outcome = switch_to_routing_in_dirs(Tool::Claude, 8899, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(outcome.written, 1);
         let text =
             std::fs::read_to_string(home.join(".claude").join("settings.json")).unwrap();
@@ -657,7 +703,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ns-switch-rg-{}", std::process::id()));
         let home = base.join("home");
         let backup = base.join("backups");
-        let outcome = switch_to_routing_in(Tool::Gemini, 8900, &backup, &home).unwrap();
+        let outcome = switch_to_routing_in_dirs(Tool::Gemini, 8900, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(outcome.written, 2, "settings.json + .env");
         let settings = std::fs::read_to_string(home.join(".gemini").join("settings.json")).unwrap();
         assert!(settings.contains("http://127.0.0.1:8900"));
@@ -683,7 +729,7 @@ mod tests {
                 }
             }),
         );
-        let o = switch_to_in(Tool::GrokBuild, &p, &backup, &home).unwrap();
+        let o = switch_to_in_dirs(Tool::GrokBuild, &p, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".grok").join("config.toml")).unwrap();
         assert!(text.contains("[model.grok-88api-test]"), "写入模型段: {text}");
@@ -698,12 +744,133 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ns-switch-grok-r-{}", std::process::id()));
         let home = base.join("home");
         let backup = base.join("backups");
-        let o = switch_to_routing_in(Tool::GrokBuild, 8903, &backup, &home).unwrap();
+        let o = switch_to_routing_in_dirs(Tool::GrokBuild, 8903, &backup, &home, &ConfigDirs::new()).unwrap();
         assert_eq!(o.written, 1);
         let text = std::fs::read_to_string(home.join(".grok").join("config.toml")).unwrap();
         assert!(text.contains("http://127.0.0.1:8903"));
         assert!(text.contains("ns-switch-routing"));
         let _ = std::fs::remove_dir_all(&base);
     }
-}
+    /// 产品级功能验证：真实预设表（706 条）→ build → 全链路 switch 引擎 →
+    /// 临时 HOME 的 live 文件，逐工具核对写入、幂等（noop）与冲突检测。
+    /// 只写临时目录，不碰本机真实 live 配置。
+    #[test]
+    fn every_preset_switches_through_engine() {
+        use ns_presets::presets_for;
 
+        let base = std::env::temp_dir().join(format!("ns-switch-all-presets-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let dirs = ConfigDirs::new();
+        let mut total = 0usize;
+        let mut written_files = 0usize;
+
+        // 每个工具取非官方预设（官方无 endpoint/key 不参与 live 写入语义）。
+        for tool in Tool::ALL {
+            let presets: Vec<_> = presets_for(tool)
+                .filter(|p| p.category != ns_presets::ProviderCategory::Official)
+                .collect();
+            if presets.is_empty() {
+                continue;
+            }
+            // 取该工具第一条预设：构建供应商并真实切换一次。
+            let p = presets[0];
+            let provider = Provider::with_id(
+                format!("{}-fncheck", p.id),
+                p.name.to_string(),
+                (p.build)("https://api.example.com", "sk-fncheck", "model-fncheck"),
+            );
+            // ClaudeDesktop 尚无 live 文件约定、Agy 卡只开终端：跳过（设计上不写）。
+            let plans = plan_for_tool_in(tool, &provider, &home, &dirs);
+            if plans.is_empty() {
+                continue;
+            }
+            // 取该工具第一条预设：构建供应商并真实切换一次。
+            let p = presets[0];
+            let provider = Provider::with_id(
+                format!("{}-fncheck", p.id),
+                p.name.to_string(),
+                (p.build)("https://api.example.com", "sk-fncheck", "model-fncheck"),
+            );
+            let outcome = switch_to_in_dirs(tool, &provider, &backup, &home, &dirs)
+                .unwrap_or_else(|e| panic!("{} 切换失败: {e}", tool.label()));
+            assert!(outcome.written >= 1, "{} 预设 {} 应写入 live 文件", tool.label(), p.name);
+            written_files += outcome.written;
+            total += 1;
+
+            // 幂等：重复切换 → noop。
+            let again = switch_to_in_dirs(tool, &provider, &backup, &home, &dirs).unwrap();
+            assert!(again.noop, "{} 重复切换应 noop", tool.label());
+
+            // 切换目标与当前一致 → 无冲突。
+            let conflicts = check_conflicts_dirs(tool, &provider, Some(&provider), &home, &dirs);
+            assert!(conflicts.is_empty(), "{} 干净切换不应冲突: {:?}", tool.label(), conflicts);
+        }
+
+        assert!(total >= 11, "应覆盖所有写 live 的工具（ClaudeDesktop/Agy 除外）: {total}");
+        assert!(written_files >= 11, "应写入 ≥11 个 live 文件: {written_files}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 产品级功能验证：4 个切换类工具的真实预设逐一写入（Claude/Codex/Gemini/Grok），
+    /// 验证关键字段落盘（端点/密钥/模型）且首写备份保留原始文件。
+    #[test]
+    fn real_presets_switch_tools_write_key_fields() {
+        use ns_presets::presets_for;
+
+        let base = std::env::temp_dir().join(format!("ns-switch-real-kf-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let dirs = ConfigDirs::new();
+
+        // 预置各工具一份「原始」live 文件，验证首写备份保留。
+        for (tool, content) in [
+            (Tool::Claude, r#"{"env":{"ANTHROPIC_BASE_URL":"https://orig.example.com"}}"#),
+            (Tool::Codex, "model_provider = \"custom\"\nmodel = \"orig\"\n"),
+            (Tool::Gemini, r#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#),
+            (Tool::GrokBuild, "[cli]\ninstaller = \"npm\"\n"),
+        ] {
+            let path = tool_base_dir(tool, &home, &dirs).join(match tool {
+                Tool::Claude | Tool::Gemini => "settings.json",
+                Tool::Codex | Tool::GrokBuild => "config.toml",
+                _ => unreachable!(),
+            });
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+        }
+
+        // 每工具取第一条非官方预设切换，核对关键字段。
+        for tool in [Tool::Claude, Tool::Codex, Tool::Gemini, Tool::GrokBuild] {
+            let p = presets_for(tool)
+                .find(|p| p.category != ns_presets::ProviderCategory::Official)
+                .expect("非官方预设");
+            let provider = Provider::with_id(
+                format!("{}-kf", p.id),
+                p.name.to_string(),
+                (p.build)("https://api.example.com", "sk-kf", "model-kf"),
+            );
+            let outcome = switch_to_in_dirs(tool, &provider, &backup, &home, &dirs).unwrap();
+            // Gemini 写 settings.json + .env 两个文件；其余写 1 个。
+            let expected = if tool == Tool::Gemini { 2 } else { 1 };
+            assert_eq!(outcome.written, expected, "{} 应写 {expected} 个文件", tool.label());
+            let dir = tool_base_dir(tool, &home, &dirs);
+            let text = if tool == Tool::Gemini {
+                std::fs::read_to_string(dir.join("settings.json")).unwrap()
+            } else {
+                let f = match tool {
+                    Tool::Claude => "settings.json",
+                    _ => "config.toml",
+                };
+                std::fs::read_to_string(dir.join(f)).unwrap()
+            };
+            // 关键字段必须落盘。
+            assert!(text.contains("https://api.example.com"), "{} 端点未落盘:\n{}", tool.label(), text);
+            assert!(text.contains("sk-kf"), "{} 密钥未落盘", tool.label());
+        }
+
+        // 首写备份保留原始文件。
+        let backups: Vec<_> = std::fs::read_dir(&backup).unwrap().collect();
+        assert!(!backups.is_empty(), "应有首写备份");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

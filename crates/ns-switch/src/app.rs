@@ -767,12 +767,13 @@ impl SwitchApp {
             let conflicts: Vec<String> = if let Some(h) = &home {
                 let mut out = Vec::new();
                 let s = scan_store.read().expect("store lock");
+                let cdirs = s.config().settings.config_dirs.clone();
                 for tool in Tool::ALL.iter() {
                     let cfg = s.config();
                     if let Some(current_id) = cfg.current.get(*tool) {
                         if let Some(current_provider) = cfg.providers.get(current_id) {
-                            let cfs = crate::switch_engine::check_conflicts(
-                                *tool, current_provider, None, h
+                            let cfs = crate::switch_engine::check_conflicts_dirs(
+                                *tool, current_provider, None, h, &cdirs
                             );
                             for c in cfs {
                                 out.push(format!("{}：{}", c.path.display(), c.reason));
@@ -1891,7 +1892,13 @@ impl SwitchApp {
         let conflicts = home
             .as_deref()
             .map(|h| {
-                crate::switch_engine::check_conflicts(tool, provider, current_provider, h)
+                crate::switch_engine::check_conflicts_dirs(
+                    tool,
+                    provider,
+                    current_provider,
+                    h,
+                    &self.config_dirs(),
+                )
             })
             .unwrap_or_default();
         self.switch_conflicts = conflicts
@@ -1923,7 +1930,10 @@ impl SwitchApp {
         cx: &mut Context<Self>,
     ) {
         let backup_dir = self.store.read().expect("store lock").backups_dir();
-        match crate::switch_engine::switch_to(tool, provider, &backup_dir) {
+        let cdirs = self.config_dirs();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let home = home.as_deref().unwrap_or_else(|| std::path::Path::new("/"));
+        match crate::switch_engine::switch_to_in_dirs(tool, provider, &backup_dir, home, &cdirs) {
             Ok(outcome) => {
                 let result = {
                     let mut store = self.store.write().expect("store lock");
@@ -10699,7 +10709,7 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             cx.notify();
             return;
         }
-        let (listen_addr, failover_enabled, breaker_threshold, breaker_cooldown) = {
+        let (listen_addr, failover_enabled, breaker_threshold, breaker_cooldown, rectify_enabled, rectify_thinking, rectify_image) = {
             let s = self.store.read().expect("store lock");
             let rc = s.config().settings.routing_for(tool);
             (
@@ -10707,6 +10717,9 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                 rc.failover,
                 rc.breaker_threshold,
                 rc.breaker_cooldown,
+                rc.rectify_enabled,
+                rc.rectify_thinking,
+                rc.rectify_image,
             )
         };
         let tool = tool;
@@ -10721,6 +10734,9 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                     failover_enabled,
                     breaker_threshold,
                     breaker_cooldown,
+                    rectify_enabled,
+                    rectify_thinking,
+                    rectify_image,
                 )
                 .await
             {
@@ -10741,8 +10757,9 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                 // 写路由 live 配置（指向 127.0.0.1:<port> + 占位 key）。
                 let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let backup = this.store.read().expect("store lock").backups_dir();
+                let cdirs = this.config_dirs();
                 match home.as_deref().map(|h| {
-                    crate::switch_engine::switch_to_routing_in(tool, port, &backup, h)
+                    crate::switch_engine::switch_to_routing_in_dirs(tool, port, &backup, h, &cdirs)
                 }) {
                     Some(Ok(outcome)) => {
                         let mut store = this.store.write().expect("store lock");
@@ -10823,7 +10840,8 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                 continue;
             };
             // 写回直连（与 switch_to_in 一致）。
-            let _ = crate::switch_engine::switch_to_in(tool, &provider, &backup, &home);
+            let cdirs = self.config_dirs();
+            let _ = crate::switch_engine::switch_to_in_dirs(tool, &provider, &backup, &home, &cdirs);
             let mut store = self.store.write().expect("store lock");
             let mut rc = store.config().settings.routing_for(tool);
             rc.enabled = false;
@@ -11565,6 +11583,15 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             Err(e) => self.status = format!("打开官网失败：{e}"),
         }
         cx.notify();
+    }
+
+    /// 当前配置目录覆盖表（key = 工具 id_str，value = 绝对路径）。
+    fn config_dirs(&self) -> crate::switch_engine::ConfigDirs {
+        self.store
+            .read()
+            .ok()
+            .map(|s| s.config().settings.config_dirs.clone())
+            .unwrap_or_default()
     }
 
     fn tool_config_dir(&self, tool: ns_presets::Tool) -> Option<std::path::PathBuf> {

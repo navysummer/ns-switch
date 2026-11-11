@@ -88,21 +88,21 @@ fn merge_edited_sections(tool: Tool, store: &mut PromptStore, existing: &str) {
     let mut entries = store.entries_for(tool);
     entries.retain(|e| e.enabled && !e.name.trim().is_empty());
     // 节名 -> 库内条目(用于比较正文是否被手改)
+    // 已知条目名集合：只有「`## <known-name>`」才是分节边界。
+    // 条目正文里可能自带 `##` 子标题（如 `## 规则`），不能当作边界。
+    let known: Vec<String> = entries.iter().map(|e| e.name.trim().to_string()).collect();
     for e in entries {
         let marker = format!("## {}\n", e.name.trim());
         if let Some(start) = text.find(&marker) {
             let body_start = start + marker.len();
-            // 节正文:从 body_start 到下一个 `## ` 节头(或文件尾)。
-            let rest = &text[body_start..];
-            let body_end = rest
-                .find("\n## ")
-                .map(|p| body_start + p)
+            // 节正文：从 body_start 到下一个已知条目的节头（或文件尾）。
+            let body_end = next_known_header(&text, body_start, &known)
                 .unwrap_or(text.len());
             let body = text[body_start..body_end].trim_end().to_string();
             let trimmed = body.trim();
             let store_body = e.body.trim();
             if !trimmed.is_empty() && trimmed != store_body {
-                // 手改过:回存到库,保留手改正文。
+                // 手改过：回存到库，保留手改正文。
                 let mut updated = e.clone();
                 updated.body = trimmed.to_string();
                 updated.updated_at = now_ms();
@@ -111,6 +111,28 @@ fn merge_edited_sections(tool: Tool, store: &mut PromptStore, existing: &str) {
         }
     }
 }
+
+/// 从 `from` 起找下一个已知条目的节头 `## <name>` 的位置（不含 `## ` 前换行）。
+/// 返回该 `## <name>` 行的起始偏移；找不到返回 `None`。
+fn next_known_header(text: &str, from: usize, known: &[String]) -> Option<usize> {
+    let mut idx = from;
+    while idx < text.len() {
+        // 在 from 之后找下一个行首的 `## `。
+        let rel = text[idx..].find("\n## ")?;
+        let header_start = idx + rel + 1; // 跳过换行，指向 `## `。
+        let line_end = text[header_start..]
+            .find('\n')
+            .map(|p| header_start + p)
+            .unwrap_or(text.len());
+        let header = text[header_start..line_end].trim();
+        let name = header.strip_prefix("## ").unwrap_or("").trim();
+        if known.iter().any(|k| k == name) {
+            return Some(header_start);
+        }
+        idx = line_end;
+    }
+    None
+ }
 /// 从文件内容中移除库内启用的命名条目对应块，返回剩余（未命名/手改）内容。
 fn extract_unmanaged_body(tool: Tool, store: &PromptStore, existing: &str) -> String {
     let mut text = existing.replace("\r\n", "\n");
@@ -362,6 +384,49 @@ mod tests {
         let text2 = std::fs::read_to_string(&file).unwrap();
         assert!(text2.contains("用户手改后的内容"), "文件应含手改正文: {text2}");
         assert!(!text2.contains("库原始内容"), "旧正文不应残留: {text2}");
+        let _ = std::fs::remove_dir_all(&paths.home);
+    }
+
+    #[test]
+    fn merge_respects_subheadings_inside_entry_body() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let paths = temp_paths();
+        let mut store = PromptStore::open_at(paths.home.clone()).unwrap();
+        // 条目正文本身带 `##` 子标题（如「## 规则」），不能误判为分节边界。
+        store
+            .save_entry(
+                Tool::Claude,
+                PromptEntry {
+                    name: "编码规范".into(),
+                    body: "## 规则\n\n用 Rust".into(),
+                    enabled: true,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+        let file = write_back(Tool::Claude, &mut store, &paths).unwrap();
+        // 用户手改命名节正文（子标题之后的文本）。
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("用 Rust", "用 Rust 2024");
+        std::fs::write(&file, text).unwrap();
+
+        let mut store2 = PromptStore::open_at(paths.home.clone()).unwrap();
+        write_back(Tool::Claude, &mut store2, &paths).unwrap();
+        // 库应回存手改正文（含子标题 + 手改文本）。
+        let lib_body = store2
+            .entries_for(Tool::Claude)
+            .into_iter()
+            .find(|e| e.name == "编码规范")
+            .map(|e| e.body)
+            .unwrap_or_default();
+        assert!(lib_body.contains("用 Rust 2024"), "库应回存手改正文: {lib_body}");
+        assert!(lib_body.contains("## 规则"), "正文子标题应保留: {lib_body}");
+        // 文件应含手改正文且子标题不被当作未命名残余重复。
+        let text2 = std::fs::read_to_string(&file).unwrap();
+        assert!(text2.contains("用 Rust 2024"), "文件应含手改正文: {text2}");
+        assert!(text2.contains("## 规则"), "文件应保留子标题: {text2}");
+        assert!(!text2.contains("用 Rust\n"), "旧正文不应残留: {text2}");
         let _ = std::fs::remove_dir_all(&paths.home);
     }
 

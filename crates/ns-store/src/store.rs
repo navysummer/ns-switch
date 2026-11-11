@@ -1,6 +1,6 @@
 //! 配置存储：读、写（原子）、供应商 CRUD、设置。
 //!
-//! 目录：`~/.ns-switch/`（Windows: `%APPDATA%`，经 `directories`）。
+//! 目录：`~/.ns-switch/`（`NS_SWITCH_HOME` 可覆盖；HOME 缺失时回退当前目录）。
 //! 结构：
 //! - `config.json` — SSOT 状态（供应商、当前选择、设置）
 //! - `backups/live-first-write/` — 首次改写每个 live 配置文件前的备份
@@ -34,10 +34,23 @@ pub struct RoutingConfig {
     /// 熔断器冷却秒数（打开后重试前等待；默认 30）。
     #[serde(default = "default_breaker_cooldown")]
     pub breaker_cooldown: u32,
+    /// 整流器启用（修正上游无法处理的请求；默认 true）。对齐 cc-switch `RectifierConfig`。
+    #[serde(default = "default_true")]
+    pub rectify_enabled: bool,
+    /// 上游是否支持 Anthropic thinking 参数（false = 整流剥离；默认 false）。
+    #[serde(default)]
+    pub rectify_thinking: bool,
+    /// 图像处理策略（0=保留 / 1=丢弃 / 2=文本占位；默认 0=保留）。
+    #[serde(default)]
+    pub rectify_image: u32,
 }
 
 fn default_breaker_threshold() -> u32 {
     3
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_breaker_cooldown() -> u32 {
@@ -53,6 +66,9 @@ impl Default for RoutingConfig {
             failover: false,
             breaker_threshold: 3,
             breaker_cooldown: 30,
+            rectify_enabled: true,
+            rectify_thinking: false,
+            rectify_image: 0,
         }
     }
 }
@@ -1366,8 +1382,10 @@ pub fn default_data_dir() -> PathBuf {
     if let Some(env) = std::env::var_os("NS_SWITCH_HOME") {
         return PathBuf::from(env);
     }
-    directories::BaseDirs::new()
-        .map(|d| d.config_dir().join("ns-switch"))
+    // 规范（AGENTS.md §1.1.3）：供应商列表与设置存 `~/.ns-switch/config.json`，
+    // 与 cc-switch 的 `~/.cc-switch/` 约定一致（不放进 macOS Application Support）。
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".ns-switch"))
         .unwrap_or_else(|| PathBuf::from(".ns-switch"))
 }
 
@@ -1944,6 +1962,27 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         let back: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(back.config_dir_for(Tool::GrokBuild), Some("/srv/grok"));
+    }
+
+    #[test]
+    fn default_data_dir_follows_spec_home_dot_ns_switch() {
+        // 规范（AGENTS.md §1.1.3）：供应商列表与设置存 `~/.ns-switch/config.json`。
+        // 不放进 macOS Application Support（与 cc-switch `~/.cc-switch/` 约定一致）。
+        unsafe {
+            std::env::set_var("NS_SWITCH_HOME", "");
+            std::env::remove_var("NS_SWITCH_HOME");
+        }
+        let home = std::env::var_os("HOME").expect("测试需要 HOME");
+        let expected = std::path::PathBuf::from(&home).join(".ns-switch");
+        assert_eq!(default_data_dir(), expected);
+        // NS_SWITCH_HOME 覆盖仍优先。
+        unsafe {
+            std::env::set_var("NS_SWITCH_HOME", "/tmp/custom-ns-home");
+        }
+        assert_eq!(default_data_dir(), std::path::PathBuf::from("/tmp/custom-ns-home"));
+        unsafe {
+            std::env::remove_var("NS_SWITCH_HOME");
+        }
     }
 
 }

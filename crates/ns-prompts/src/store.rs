@@ -133,8 +133,9 @@ pub fn default_data_dir() -> PathBuf {
     if let Some(env) = std::env::var_os("NS_SWITCH_HOME") {
         return PathBuf::from(env);
     }
-    directories::BaseDirs::new()
-        .map(|d| d.config_dir().join("ns-switch"))
+    // 规范（AGENTS.md §1.1.3）：与 ns-store 一致，`~/.ns-switch/`。
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".ns-switch"))
         .unwrap_or_else(|| PathBuf::from(".ns-switch"))
 }
 

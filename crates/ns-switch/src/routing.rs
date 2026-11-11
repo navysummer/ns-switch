@@ -7,6 +7,15 @@ use std::collections::BTreeMap;
 use ns_presets::{Provider, Tool};
 use ns_proxy::Upstream;
 
+/// 整流图像策略：u32 → `ImageMode`（0=保留 / 1=丢弃 / 2=文本占位）。
+pub fn image_mode_from_u32(v: u32) -> ns_proxy::rectify::ImageMode {
+    match v {
+        1 => ns_proxy::rectify::ImageMode::Drop,
+        2 => ns_proxy::rectify::ImageMode::TextPlaceholder,
+        _ => ns_proxy::rectify::ImageMode::Keep,
+    }
+}
+
 
 /// 运行中的本地代理。
 pub struct RunningProxy {
@@ -52,6 +61,9 @@ impl RoutingRuntime {
         failover_enabled: bool,
         breaker_threshold: u32,
         breaker_cooldown_secs: u32,
+        rectify_enabled: bool,
+        rectify_thinking: bool,
+        rectify_image: u32,
     ) -> anyhow::Result<u16> {
         if let Some(p) = self.proxies.get_mut(&tool) {
             return Ok(p.port);
@@ -73,6 +85,13 @@ impl RoutingRuntime {
                     .with_breaker(breaker_threshold, breaker_cooldown_secs)
             }
         };
+        // 整流器：enabled=false 时等效不整流（supports_thinking=true + Keep）。
+        let (rect_supports, rect_image) = if rectify_enabled {
+            (rectify_thinking, image_mode_from_u32(rectify_image))
+        } else {
+            (true, ns_proxy::rectify::ImageMode::Keep)
+        };
+        let config = config.with_rectify(rect_supports, rect_image);
         let breakers = config.breakers.clone();
         let bind_addr = format!("{listen_addr}:0");
         let (listener, addr) = ns_proxy::bind(bind_addr.parse()?).await?;
@@ -268,7 +287,7 @@ mod tests {
         let mut rt = RoutingRuntime::new();
         let upstream = Upstream::new("http://127.0.0.1:9", "sk"); // 无需可达，仅生命周期。
         let port = rt
-            .ensure_running_with(Tool::Claude, vec![upstream], None, "127.0.0.1", true, 3, 30)
+            .ensure_running_with(Tool::Claude, vec![upstream], None, "127.0.0.1", true, 3, 30, true, false, 0)
             .await
             .unwrap();
         assert!(port > 0);
@@ -284,6 +303,9 @@ mod tests {
                 true,
                 3,
                 30,
+                true,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -302,6 +324,9 @@ mod tests {
                 true,
                 3,
                 30,
+                true,
+                false,
+                0,
             )
             .await
             .unwrap();
@@ -325,5 +350,14 @@ mod tests {
         let routes = aggregation_model_routes(&[&a, &b]);
         assert_eq!(routes.get("claude-sonnet-4-5"), Some(&0));
         assert_eq!(routes.get("gpt-6-sol"), Some(&1));
+    }
+
+    #[test]
+    fn image_mode_mapping() {
+        use ns_proxy::rectify::ImageMode;
+        assert_eq!(image_mode_from_u32(0), ImageMode::Keep);
+        assert_eq!(image_mode_from_u32(1), ImageMode::Drop);
+        assert_eq!(image_mode_from_u32(2), ImageMode::TextPlaceholder);
+        assert_eq!(image_mode_from_u32(99), ImageMode::Keep);
     }
 }
