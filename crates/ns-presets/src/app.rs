@@ -101,9 +101,73 @@ impl Tool {
 
     /// 切换后是否需要重启终端/进程：
     /// Claude Code 每次命令读取 settings.json（热切换）；
-    /// Codex/Gemini/Grok 等在运行中的会话可能缓存配置。
+    /// Claude Desktop 读取启动时的 profile；Codex/Gemini/Grok 等在运行中的会话会缓存配置。
     pub fn needs_restart(self) -> bool {
-        !matches!(self, Tool::Claude | Tool::ClaudeDesktop)
+        !matches!(self, Tool::Claude)
+    }
+
+    /// 工具的默认配置目录（不存在也返回约定路径）。
+    ///
+    /// 与 `switch_engine`/MCP 适配器使用的写入路径保持一致；界面「打开配置目录」
+    /// 与设置页展示都走这里，避免各处硬编码漂移。
+    pub fn default_config_dir(self, home: &std::path::Path) -> std::path::PathBuf {
+        match self {
+            Tool::Claude => home.join(".claude"),
+            Tool::ClaudeDesktop => {
+                #[cfg(target_os = "macos")]
+                {
+                    home.join("Library")
+                        .join("Application Support")
+                        .join("Claude-3p")
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    std::env::var_os("LOCALAPPDATA")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| home.join("AppData").join("Local"))
+                        .join("Claude-3p")
+                }
+                #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+                {
+                    std::env::var_os("XDG_CONFIG_HOME")
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.is_absolute())
+                        .unwrap_or_else(|| home.join(".config"))
+                        .join("Claude-3p")
+                }
+            }
+            Tool::Codex => home.join(".codex"),
+            Tool::Gemini => home.join(".gemini"),
+            Tool::GrokBuild => home.join(".grok"),
+            Tool::Opencode => home.join(".config").join("opencode"),
+            Tool::Openclaw => home.join(".openclaw"),
+            Tool::Pi => home.join(".pi").join("agent"),
+            Tool::Hermes => home.join(".hermes"),
+            Tool::Mcode => home.join(".minimax"),
+            Tool::Kimi => home.join(".kimi-code"),
+            Tool::Agy => home.join(".agy"),
+            Tool::Omp => home.join(".omp").join("agent"),
+        }
+    }
+
+    /// 工具的主配置文件路径（用于「打开配置目录」定位与展示）。
+    pub fn primary_config_path(self, home: &std::path::Path) -> std::path::PathBuf {
+        let dir = self.default_config_dir(home);
+        dir.join(match self {
+            Tool::Claude => "settings.json",
+            Tool::ClaudeDesktop => "claude_desktop_config.json",
+            Tool::Codex => "config.toml",
+            Tool::Gemini => "settings.json",
+            Tool::GrokBuild => "config.toml",
+            Tool::Opencode => "opencode.json",
+            Tool::Openclaw => "openclaw.json",
+            Tool::Pi => "models.json",
+            Tool::Hermes => "config.yaml",
+            Tool::Mcode => "config.yaml",
+            Tool::Kimi => "config.toml",
+            Tool::Agy => "settings.json",
+            Tool::Omp => "models.yml",
+        })
     }
 
     /// 序列化用的 kebab-case id（与 `template_type` 一致）。
@@ -173,10 +237,28 @@ mod tests {
     #[test]
     fn claude_hot_switches_others_restart() {
         assert!(!Tool::Claude.needs_restart(), "Claude Code 热切换");
-        assert!(!Tool::ClaudeDesktop.needs_restart());
+        assert!(Tool::ClaudeDesktop.needs_restart(), "Claude Desktop 需重启读取 profile");
         assert!(Tool::Codex.needs_restart());
         assert!(Tool::Gemini.needs_restart());
         assert!(Tool::GrokBuild.needs_restart());
         assert!(Tool::Opencode.needs_restart());
+    }
+
+    #[test]
+    fn config_dirs_match_writer_paths() {
+        let home = std::path::Path::new("/tmp/home");
+        assert_eq!(Tool::Kimi.default_config_dir(home), home.join(".kimi-code"));
+        assert_eq!(Tool::Mcode.default_config_dir(home), home.join(".minimax"));
+        assert_eq!(Tool::Omp.default_config_dir(home), home.join(".omp/agent"));
+        assert_eq!(Tool::GrokBuild.default_config_dir(home), home.join(".grok"));
+        assert_eq!(Tool::Pi.default_config_dir(home), home.join(".pi/agent"));
+        assert_eq!(
+            Tool::Kimi.primary_config_path(home),
+            home.join(".kimi-code/config.toml")
+        );
+        assert_eq!(
+            Tool::Omp.primary_config_path(home),
+            home.join(".omp/agent/models.yml")
+        );
     }
 }

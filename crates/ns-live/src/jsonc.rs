@@ -29,7 +29,7 @@ pub fn apply_jsonc(path: &Path, patch: &JsonPatch, pre: Option<&[u8]>) -> Result
 }
 
 /// 简单序列化（无原始文件时）。
-fn serialize_simple(doc: &Value, style: &JsonStyle) -> Vec<u8> {
+pub(crate) fn serialize_simple(doc: &Value, style: &JsonStyle) -> Vec<u8> {
     let text = serde_json::to_string_pretty(doc).expect("serialize");
     let mut text = text;
     if style.trailing_newline && !text.ends_with('\n') {

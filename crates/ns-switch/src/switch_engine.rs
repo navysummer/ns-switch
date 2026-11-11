@@ -10,7 +10,7 @@ use ns_live::{
     EnvPatch, JsonPatch, LiveFile, LivePatch, LiveWriteError, claude_patch, codex_patch,
     gemini_env_entries, gemini_settings_patch, lock_app,
 };
-use ns_presets::{Provider, Tool};
+use ns_presets::{Provider, ProviderCategory, Tool};
 
 /// 一个工具的 live 写入计划（文件 + 补丁）。
 pub struct LivePlan {
@@ -25,6 +25,8 @@ pub enum Patch {
     Toml(ns_live::TomlPatch),
     Env(EnvPatch),
     Yaml(ns_live::YamlPatch),
+    /// Claude Desktop `_meta.json`（数组增删，非纯键值补丁）。
+    DesktopMeta(ns_live::DesktopMetaPatch),
 }
 
 impl LivePatch for Patch {
@@ -34,6 +36,7 @@ impl LivePatch for Patch {
             Patch::Toml(p) => p.apply(path, pre),
             Patch::Env(p) => p.apply(path, pre),
             Patch::Yaml(p) => p.apply(path, pre),
+            Patch::DesktopMeta(p) => p.apply(path, pre),
         }
     }
 }
@@ -54,37 +57,27 @@ fn tool_base_dir(
     {
         return std::path::PathBuf::from(d);
     }
-    match tool {
-        Tool::Claude => home.join(".claude"),
-        Tool::Codex => home.join(".codex"),
-        Tool::Gemini => home.join(".gemini"),
-        Tool::GrokBuild => home.join(".grok"),
-        Tool::Opencode => home.join(".config").join("opencode"),
-        Tool::Openclaw => home.join(".openclaw"),
-        Tool::Pi => home.join(".pi").join("agent"),
-        Tool::Hermes => home.join(".hermes"),
-        Tool::Mcode => home.join(".minimax"),
-        Tool::Kimi => home.join(".kimi-code"),
-        Tool::Omp => home.join(".omp").join("agent"),
-        Tool::Agy => home.join(".agy"),
-        _ => home.join(format!(".{}", tool.id_str())),
-    }
+    tool.default_config_dir(home)
 }
 
 /// 指定家目录的 live 计划（测试可用临时目录）。
-pub fn plan_for_tool_in(
+///
+/// 失败表示该工具当前无法安全投影（如 Claude Desktop 缺少端点/密钥），
+/// 调用方应报错而不是静默跳过。
+pub fn plan_for_tool_in_result(
     tool: Tool,
     provider: &Provider,
     home: &std::path::Path,
     config_dirs: &ConfigDirs,
-) -> Vec<LivePlan> {
+) -> Result<Vec<LivePlan>, LiveWriteError> {
     let cfg = &provider.settings_config;
     let dir = tool_base_dir(tool, home, config_dirs);
-    match tool {
+    let plans = match tool {
         Tool::Claude => vec![LivePlan {
             file: LiveFile::new("claude", dir.join("settings.json"), true),
             patch: Patch::Json(claude_patch(cfg)),
         }],
+        Tool::ClaudeDesktop => desktop_plans(tool, provider, home, config_dirs)?,
         Tool::Codex => vec![LivePlan {
             file: LiveFile::new("codex", dir.join("config.toml"), true),
             patch: Patch::Toml(codex_patch(cfg)),
@@ -144,9 +137,68 @@ pub fn plan_for_tool_in(
         }],
         // Agy 卡只开终端，不写 live 文件。
         Tool::Agy => Vec::new(),
-        // 其余工具：M5 起逐个接入；当前无 live 文件写入。
-        _ => Vec::new(),
-    }
+    };
+    Ok(plans)
+}
+
+/// 忽略错误的便利版（仅用于测试；切换路径必须用 `plan_for_tool_in_result`）。
+#[cfg(test)]
+pub fn plan_for_tool_in(
+    tool: Tool,
+    provider: &Provider,
+    home: &std::path::Path,
+    config_dirs: &ConfigDirs,
+) -> Vec<LivePlan> {
+    plan_for_tool_in_result(tool, provider, home, config_dirs).unwrap_or_default()
+}
+
+/// Claude Desktop 的 live 计划：两个 `deploymentMode` + 3p 网关 profile + `_meta.json`。
+///
+/// 官方供应商回退 1p 并摘除 ns-switch profile；第三方写 3p 网关资料。
+/// 直连模式下只写 Claude 安全模型名（非 Claude 品牌留给 Desktop 自身模型发现）。
+fn desktop_plans(
+    tool: Tool,
+    provider: &Provider,
+    home: &std::path::Path,
+    config_dirs: &ConfigDirs,
+) -> Result<Vec<LivePlan>, LiveWriteError> {
+    use ns_live::{DEPLOYMENT_1P, DEPLOYMENT_3P, DesktopMetaPatch, deployment_patch,
+        desktop_paths_from_tool_dir, official_profile_patch, profile_patch};
+    // 覆盖目录按工具配置目录解释（即 `Claude-3p`），父目录是应用数据根。
+    let base = tool_base_dir(tool, home, config_dirs);
+    let paths = desktop_paths_from_tool_dir(&base);
+    let official = provider.category == Some(ProviderCategory::Official);
+    let mode = if official { DEPLOYMENT_1P } else { DEPLOYMENT_3P };
+    let profile = if official {
+        official_profile_patch()
+    } else {
+        profile_patch(&provider.settings_config, &ns_presets::provider_models(provider))
+            .map_err(|message| LiveWriteError::Invalid {
+                path: paths.profile.clone(),
+                message,
+            })?
+    };
+    let file = |path: std::path::PathBuf, private: bool| {
+        LiveFile::new("claude-desktop", path, private)
+    };
+    Ok(vec![
+        LivePlan {
+            file: file(paths.normal_config, false),
+            patch: Patch::Json(deployment_patch(mode)),
+        },
+        LivePlan {
+            file: file(paths.threep_config, false),
+            patch: Patch::Json(deployment_patch(mode)),
+        },
+        LivePlan {
+            file: file(paths.profile, true),
+            patch: Patch::Json(profile),
+        },
+        LivePlan {
+            file: file(paths.meta, false),
+            patch: Patch::DesktopMeta(DesktopMetaPatch { applied: !official }),
+        },
+    ])
 }
 
 /// 路由模式下某工具要写的 live 文件计划：把配置指向本地代理
@@ -203,6 +255,7 @@ pub fn switch_to_routing_in_dirs(
         return Ok(SwitchOutcome {
             written: 0,
             noop: true,
+            planned: 0,
         });
     }
     let app = tool.id_str();
@@ -221,6 +274,7 @@ pub fn switch_to_routing_in_dirs(
     Ok(SwitchOutcome {
         written,
         noop,
+        planned: plans.len(),
     })
 }
 /// 一个冲突告警（写入前检查）。
@@ -249,9 +303,13 @@ pub fn check_conflicts_dirs(
     config_dirs: &ConfigDirs,
 ) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
-    let target_plans = plan_for_tool_in(tool, target, home, config_dirs);
+    let Ok(target_plans) = plan_for_tool_in_result(tool, target, home, config_dirs) else {
+        // 无法投影（缺端点/密钥等）：交给切换路径报明确错误，不伪装成冲突。
+        return conflicts;
+    };
     // 当前激活供应商的预期内容（用于「磁盘是否等于 B 的写入」判断）。
-    let current_plans = current_provider.map(|p| plan_for_tool_in(tool, p, home, config_dirs));
+    let current_plans =
+        current_provider.and_then(|p| plan_for_tool_in_result(tool, p, home, config_dirs).ok());
     for plan in &target_plans {
         let Some(pre) = ns_live::read_current(&plan.file.path).ok().flatten() else {
             continue; // 文件不存在：无冲突
@@ -278,6 +336,227 @@ pub fn check_conflicts_dirs(
     conflicts
 }
 
+/// 从当前客户端 live 配置提取的供应商连接参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedConfig {
+    pub endpoint: String,
+    pub key: String,
+    pub model: String,
+}
+
+impl ImportedConfig {
+    /// 转成该工具的 `settings_config`（与预设 build 形状一致）。
+    pub fn settings_config(&self, tool: Tool) -> serde_json::Value {
+        ns_presets::settings_config_for(tool, &self.endpoint, &self.key, &self.model)
+    }
+}
+
+/// 读取当前客户端 live 配置，提取可保存为供应商的端点/密钥/模型。
+///
+/// 只读不写；解析失败或缺少端点时返回明确错误（官方登录模式没有端点，无法导入）。
+pub fn import_current_config(
+    tool: Tool,
+    home: &std::path::Path,
+    config_dirs: &ConfigDirs,
+) -> Result<ImportedConfig, String> {
+    let dir = tool_base_dir(tool, home, config_dirs);
+    let imported = match tool {
+        Tool::Claude => {
+            let value = ns_live::read_json_document(&dir.join("settings.json"))?;
+            let env = value.get("env").and_then(serde_json::Value::as_object);
+            let read = |keys: &[&str]| {
+                keys.iter().find_map(|k| {
+                    env.and_then(|e| e.get(*k))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+            };
+            ImportedConfig {
+                endpoint: read(&["ANTHROPIC_BASE_URL"]).ok_or_else(|| {
+                    "settings.json 未设置 ANTHROPIC_BASE_URL（官方登录模式无法导入）".to_string()
+                })?,
+                key: read(&["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]).unwrap_or_default(),
+                model: read(&["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"])
+                    .unwrap_or_default(),
+            }
+        }
+        Tool::ClaudeDesktop => {
+            let paths = ns_live::desktop_paths_from_tool_dir(&dir);
+            let value = ns_live::read_json_document(&paths.profile)?;
+            let text = |key: &str| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            ImportedConfig {
+                endpoint: text("inferenceGatewayBaseUrl").ok_or_else(|| {
+                    "Claude Desktop profile 未设置 inferenceGatewayBaseUrl（官方模式无法导入）"
+                        .to_string()
+                })?,
+                key: text("inferenceGatewayApiKey").unwrap_or_default(),
+                model: value
+                    .get("inferenceModels")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+            }
+        }
+        Tool::Codex => import_codex(&dir)?,
+        Tool::Gemini => import_gemini(&dir)?,
+        Tool::GrokBuild => import_grok(&dir)?,
+        _ => {
+            return Err(format!(
+                "{} 暂无固定连接字段约定，暂不支持从客户端配置导入",
+                tool.label()
+            ));
+        }
+    };
+    if imported.endpoint.trim().is_empty() {
+        return Err("未找到端点地址".to_string());
+    }
+    Ok(imported)
+}
+
+fn import_codex(dir: &std::path::Path) -> Result<ImportedConfig, String> {
+    let path = dir.join("config.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
+    let doc: toml::Value = text
+        .parse()
+        .map_err(|err| format!("解析 {} 失败: {err}", path.display()))?;
+    let tables = doc.get("model_providers").and_then(toml::Value::as_table);
+    let wanted = doc
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
+    let (provider_id, table) = tables
+        .and_then(|t| {
+            t.get(wanted)
+                .and_then(toml::Value::as_table)
+                .map(|table| (wanted.to_string(), table))
+                .or_else(|| {
+                    t.iter().find_map(|(id, value)| {
+                        value.as_table().map(|table| (id.clone(), table))
+                    })
+                })
+        })
+        .ok_or_else(|| format!("{} 未找到 model_providers 表", path.display()))?;
+    let table_str = |key: &str| {
+        table
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let endpoint = table_str("base_url")
+        .ok_or_else(|| format!("model_providers.{provider_id} 未设置 base_url"))?;
+    let auth = doc.get("auth").and_then(toml::Value::as_table);
+    let key = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+        .iter()
+        .find_map(|k| auth.and_then(|a| a.get(*k)).and_then(toml::Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
+    let model = doc
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(ImportedConfig {
+        endpoint,
+        key,
+        model,
+    })
+}
+
+fn import_gemini(dir: &std::path::Path) -> Result<ImportedConfig, String> {
+    let mut env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    if let Ok(value) = ns_live::read_json_document(&dir.join("settings.json")) {
+        if let Some(map) = value.get("env").and_then(serde_json::Value::as_object) {
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    env.insert(k.clone(), s.trim().to_string());
+                }
+            }
+        }
+    }
+    // `.env` 覆盖 settings.json（切换引擎两处同写，`~/.gemini/.env` 是 CLI 主读取点）。
+    if let Ok(text) = std::fs::read_to_string(dir.join(".env")) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                env.insert(k.trim().to_string(), v);
+            }
+        }
+    }
+    let read = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| env.get(*k))
+            .filter(|s| !s.is_empty())
+            .cloned()
+    };
+    Ok(ImportedConfig {
+        endpoint: read(&["GEMINI_BASE_URL"]).ok_or_else(|| {
+            "Gemini 配置未设置 GEMINI_BASE_URL（官方登录模式无法导入）".to_string()
+        })?,
+        key: read(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).unwrap_or_default(),
+        model: read(&["GEMINI_MODEL"]).unwrap_or_default(),
+    })
+}
+
+fn import_grok(dir: &std::path::Path) -> Result<ImportedConfig, String> {
+    let path = dir.join("config.toml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
+    let doc: toml::Value = text
+        .parse()
+        .map_err(|err| format!("解析 {} 失败: {err}", path.display()))?;
+    let default = doc
+        .get("models")
+        .and_then(|m| m.get("default"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
+    let tables = doc.get("model").and_then(toml::Value::as_table);
+    let (id, table) = tables
+        .and_then(|t| {
+            t.get(default)
+                .and_then(toml::Value::as_table)
+                .map(|table| (default.to_string(), table))
+                .or_else(|| {
+                    t.iter()
+                        .find_map(|(id, value)| value.as_table().map(|table| (id.clone(), table)))
+                })
+        })
+        .ok_or_else(|| format!("{} 未找到 [model.<id>] 表", path.display()))?;
+    let table_str = |key: &str| {
+        table
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Ok(ImportedConfig {
+        endpoint: table_str("base_url")
+            .ok_or_else(|| format!("[model.{id}] 未设置 base_url"))?,
+        key: table_str("api_key").unwrap_or_default(),
+        model: table_str("model").unwrap_or_else(|| id.clone()),
+    })
+}
+
 /// 切换结果（用于状态栏/通知）。
 #[derive(Debug, Clone)]
 pub struct SwitchOutcome {
@@ -285,6 +564,15 @@ pub struct SwitchOutcome {
     pub written: usize,
     /// 是否为 noop（内容与现有一致）。
     pub noop: bool,
+    /// 该工具计划写入的文件数（0 = 该工具没有独立的 live 配置文件）。
+    pub planned: usize,
+}
+
+impl SwitchOutcome {
+    /// 该工具是否根本没有 live 配置文件（切换只记录当前选择）。
+    pub fn has_no_live_files(&self) -> bool {
+        self.planned == 0
+    }
 }
 /// 指定家目录的切换（测试用临时目录）。
 /// 指定家目录 + 配置目录覆盖的切换。
@@ -295,11 +583,12 @@ pub fn switch_to_in_dirs(
     home: &std::path::Path,
     config_dirs: &ConfigDirs,
 ) -> Result<SwitchOutcome, LiveWriteError> {
-    let plans = plan_for_tool_in(tool, provider, home, config_dirs);
+    let plans = plan_for_tool_in_result(tool, provider, home, config_dirs)?;
     if plans.is_empty() {
         return Ok(SwitchOutcome {
             written: 0,
             noop: true,
+            planned: 0,
         });
     }
     let app = tool.id_str();
@@ -318,6 +607,7 @@ pub fn switch_to_in_dirs(
     Ok(SwitchOutcome {
         written,
         noop,
+        planned: plans.len(),
     })
 }
 
@@ -511,6 +801,255 @@ mod tests {
         let provider = claude_provider();
         // Agy 卡只开终端，不写 live 文件。
         assert!(plan_for_tool_in(Tool::Agy, &provider, &home, &ConfigDirs::new()).is_empty());
+    }
+
+    fn desktop_provider(name: &str, category: ns_presets::ProviderCategory, cfg: serde_json::Value) -> Provider {
+        let mut p = Provider::with_id(format!("cdesk-{name}-test"), name.into(), cfg);
+        p.category = Some(category);
+        p.meta = Some(ns_presets::ProviderMeta {
+            models: Some(vec!["kimi-k2.7-code".into(), "claude-sonnet-5".into()]),
+            ..Default::default()
+        });
+        p
+    }
+
+    #[test]
+    fn claude_desktop_switch_writes_3p_profile_and_restores_official() {
+        let base = std::env::temp_dir().join(format!("ns-switch-desktop-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let dirs = ConfigDirs::new();
+
+        let third_party = desktop_provider(
+            "kimi",
+            ns_presets::ProviderCategory::ThirdParty,
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.kimi.example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-desktop",
+                    "ANTHROPIC_MODEL": "kimi-k2.7-code",
+                }
+            }),
+        );
+        let outcome =
+            switch_to_in_dirs(Tool::ClaudeDesktop, &third_party, &backup, &home, &dirs).unwrap();
+        assert_eq!(outcome.written, 4, "两个 deploymentMode + profile + _meta");
+        assert_eq!(outcome.planned, 4);
+
+        let paths = ns_live::desktop_paths(&home);
+        let normal: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.normal_config).unwrap()).unwrap();
+        assert_eq!(normal["deploymentMode"], "3p", "普通目录也需切到 3p");
+        let threep: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.threep_config).unwrap()).unwrap();
+        assert_eq!(threep["deploymentMode"], "3p");
+
+        let profile: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.profile).unwrap()).unwrap();
+        assert_eq!(profile["inferenceProvider"], "gateway");
+        assert_eq!(profile["inferenceGatewayBaseUrl"], "https://api.kimi.example.com");
+        assert_eq!(profile["inferenceGatewayApiKey"], "sk-desktop");
+        assert_eq!(profile["inferenceGatewayAuthScheme"], "bearer");
+        // 直连只写 Claude 安全模型名，非 Claude 品牌留给 Desktop 模型发现。
+        assert_eq!(profile["inferenceModels"], serde_json::json!(["claude-sonnet-5"]));
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert_eq!(meta["appliedId"], ns_live::PROFILE_ID);
+        assert!(meta["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == ns_live::PROFILE_ID));
+
+        // 幂等：同一供应商重复切换 → noop。
+        let again =
+            switch_to_in_dirs(Tool::ClaudeDesktop, &third_party, &backup, &home, &dirs).unwrap();
+        assert!(again.noop, "重复切换应 noop");
+
+        // 切回官方：1p + 清关键字段 + 摘除 profile 条目。
+        let official = desktop_provider(
+            "official",
+            ns_presets::ProviderCategory::Official,
+            serde_json::json!({}),
+        );
+        let restored =
+            switch_to_in_dirs(Tool::ClaudeDesktop, &official, &backup, &home, &dirs).unwrap();
+        assert!(restored.written >= 3, "应写回 deploymentMode/profile/meta");
+        let normal: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.normal_config).unwrap()).unwrap();
+        assert_eq!(normal["deploymentMode"], "1p");
+        let profile: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.profile).unwrap()).unwrap();
+        assert!(profile.get("inferenceProvider").is_none(), "官方模式清网关字段");
+        assert!(profile.get("inferenceGatewayApiKey").is_none());
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert!(meta.get("appliedId").is_none(), "摘除后不残留 appliedId");
+        assert!(!meta["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == ns_live::PROFILE_ID));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claude_desktop_missing_credentials_fails_loudly() {
+        let base = std::env::temp_dir().join(format!("ns-switch-desktop-bad-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let dirs = ConfigDirs::new();
+        let broken = desktop_provider(
+            "broken",
+            ns_presets::ProviderCategory::ThirdParty,
+            serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "https://api.example.com" } }),
+        );
+        let err = switch_to_in_dirs(Tool::ClaudeDesktop, &broken, &backup, &home, &dirs)
+            .expect_err("缺密钥应报错而不是静默成功");
+        assert!(err.to_string().contains("ANTHROPIC_AUTH_TOKEN"), "{err}");
+        // 冲突检测不应把它伪装成冲突（交给切换路径报明确错误）。
+        assert!(check_conflicts_dirs(Tool::ClaudeDesktop, &broken, None, &home, &dirs).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn imports_current_config_from_each_switch_tool() {
+        let base = std::env::temp_dir().join(format!("ns-switch-import-{}", std::process::id()));
+        let home = base.join("home");
+        let dirs = ConfigDirs::new();
+
+        // Claude Code：env 里的端点/密钥/模型。
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.claude.example.com",
+                    "ANTHROPIC_AUTH_TOKEN": "sk-claude",
+                    "ANTHROPIC_MODEL": "claude-sonnet-5"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let imported = import_current_config(Tool::Claude, &home, &dirs).unwrap();
+        assert_eq!(imported.endpoint, "https://api.claude.example.com");
+        assert_eq!(imported.key, "sk-claude");
+        assert_eq!(imported.model, "claude-sonnet-5");
+        // 导入结果再切回引擎应写出一致字段（往返自洽）。
+        let provider = Provider::with_id(
+            "claude-imported".into(),
+            "导入".into(),
+            imported.settings_config(Tool::Claude),
+        );
+        let backup = base.join("backups");
+        switch_to_in_dirs(Tool::Claude, &provider, &backup, &home, &dirs).unwrap();
+        let text = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        assert!(text.contains("api.claude.example.com"));
+
+        // Codex：model_provider → model_providers.<id>.base_url + auth.OPENAI_API_KEY。
+        let codex_dir = home.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            r#"model_provider = "custom"
+model = "gpt-6"
+[auth]
+OPENAI_API_KEY = "sk-codex"
+[model_providers.custom]
+base_url = "https://api.codex.example.com"
+wire_api = "chat"
+"#,
+        )
+        .unwrap();
+        let imported = import_current_config(Tool::Codex, &home, &dirs).unwrap();
+        assert_eq!(imported.endpoint, "https://api.codex.example.com");
+        assert_eq!(imported.key, "sk-codex");
+        assert_eq!(imported.model, "gpt-6");
+
+        // Gemini：settings.json + .env（.env 优先）。
+        let gemini_dir = home.join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::fs::write(
+            gemini_dir.join("settings.json"),
+            r#"{"env":{"GEMINI_BASE_URL":"https://old.example.com"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            gemini_dir.join(".env"),
+            "GEMINI_BASE_URL=https://api.gemini.example.com\nGEMINI_API_KEY=sk-gemini\nGEMINI_MODEL=gemini-3-pro\n",
+        )
+        .unwrap();
+        let imported = import_current_config(Tool::Gemini, &home, &dirs).unwrap();
+        assert_eq!(imported.endpoint, "https://api.gemini.example.com");
+        assert_eq!(imported.key, "sk-gemini");
+        assert_eq!(imported.model, "gemini-3-pro");
+
+        // Grok：models.default → [model.<id>]。
+        let grok_dir = home.join(".grok");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+        std::fs::write(
+            grok_dir.join("config.toml"),
+            r#"[models]
+default = "grok-x"
+[model.grok-x]
+name = "grok-x"
+base_url = "https://api.grok.example.com"
+api_key = "sk-grok"
+model = "grok-4.5"
+"#,
+        )
+        .unwrap();
+        let imported = import_current_config(Tool::GrokBuild, &home, &dirs).unwrap();
+        assert_eq!(imported.endpoint, "https://api.grok.example.com");
+        assert_eq!(imported.key, "sk-grok");
+        assert_eq!(imported.model, "grok-4.5");
+
+        // Claude Desktop：3p profile 的网关字段。
+        let desktop = ns_live::desktop_paths(&home);
+        std::fs::create_dir_all(desktop.profile.parent().unwrap()).unwrap();
+        std::fs::write(
+            &desktop.profile,
+            serde_json::json!({
+                "inferenceGatewayBaseUrl": "https://api.desktop.example.com",
+                "inferenceGatewayApiKey": "sk-desktop",
+                "inferenceModels": ["claude-sonnet-5"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let imported = import_current_config(Tool::ClaudeDesktop, &home, &dirs).unwrap();
+        assert_eq!(imported.endpoint, "https://api.desktop.example.com");
+        assert_eq!(imported.key, "sk-desktop");
+        assert_eq!(imported.model, "claude-sonnet-5");
+
+        // 官方登录模式（无端点）应明确报错。
+        std::fs::write(claude_dir.join("settings.json"), r#"{"env":{}}"#).unwrap();
+        let err = import_current_config(Tool::Claude, &home, &dirs).unwrap_err();
+        assert!(err.contains("ANTHROPIC_BASE_URL"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn agy_reports_no_live_files() {
+        let base = std::env::temp_dir().join(format!("ns-switch-agy-{}", std::process::id()));
+        let home = base.join("home");
+        let backup = base.join("backups");
+        let outcome = switch_to_in_dirs(
+            Tool::Agy,
+            &claude_provider(),
+            &backup,
+            &home,
+            &ConfigDirs::new(),
+        )
+        .unwrap();
+        assert!(outcome.has_no_live_files(), "Agy 无独立配置文件，界面应明示");
+        assert_eq!(outcome.written, 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -780,7 +1319,7 @@ mod tests {
                 p.name.to_string(),
                 (p.build)("https://api.example.com", "sk-fncheck", "model-fncheck"),
             );
-            // ClaudeDesktop 尚无 live 文件约定、Agy 卡只开终端：跳过（设计上不写）。
+            // ClaudeDesktop 走 3p profile，Agy 卡只开终端（无 live 文件）：跳过无计划工具。
             let plans = plan_for_tool_in(tool, &provider, &home, &dirs);
             if plans.is_empty() {
                 continue;
@@ -807,7 +1346,7 @@ mod tests {
             assert!(conflicts.is_empty(), "{} 干净切换不应冲突: {:?}", tool.label(), conflicts);
         }
 
-        assert!(total >= 11, "应覆盖所有写 live 的工具（ClaudeDesktop/Agy 除外）: {total}");
+        assert!(total >= 12, "应覆盖所有写 live 的工具（Agy 除外）: {total}");
         assert!(written_files >= 11, "应写入 ≥11 个 live 文件: {written_files}");
         let _ = std::fs::remove_dir_all(&base);
     }

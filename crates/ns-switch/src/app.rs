@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use gpui::{
     Context, Div, FocusHandle, KeyBinding, Render, Stateful, div, prelude::*, px, rgb, Hsla,
-    actions,
+    ClipboardItem, actions,
 };
 use ns_presets::Tool;
 use ns_store::Store;
@@ -160,6 +160,18 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// 缓存命中率（%）：缓存读 /（输入 + 缓存读）。两者都为 0 时返回 0。
+///
+/// Anthropic/Codex 的 `input_tokens` 不含缓存读，所以缓存读要计入分母。
+fn cache_hit_rate(cache_read: u64, input: u64) -> f64 {
+    let total = cache_read.saturating_add(input);
+    if total == 0 {
+        0.0
+    } else {
+        cache_read as f64 / total as f64 * 100.0
+    }
+}
+
 /// 合并两组按日统计（同日期累加），按日期排序。
 fn merge_daily(
     a: Vec<ns_usage::DailyCount>,
@@ -186,6 +198,15 @@ fn merge_details(
     a.extend(b);
     a.sort_by_key(|d| std::cmp::Reverse(d.ts_ms));
     a
+}
+
+/// 在系统终端执行恢复命令（命令由 `ns_sessions::recover_command_for` 生成）。
+fn run_terminal_command(cmd: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let spawn = std::process::Command::new("cmd").arg("/C").arg(cmd).spawn();
+    #[cfg(not(target_os = "windows"))]
+    let spawn = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
+    spawn.map(|_| ())
 }
 
 /// Page → 侧栏图标字形（纯文本，后续可换 SVG）。
@@ -240,6 +261,22 @@ impl StatusTone {
             StatusTone::Neutral => theme::text_dim(),
             StatusTone::Success => theme::jade(),
             StatusTone::Error => theme::danger(),
+        }
+    }
+}
+
+/// 备份恢复来源：live 配置文件首写备份 / 手动 config.json 备份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackupRestoreKind {
+    Live,
+    Manual,
+}
+
+impl BackupRestoreKind {
+    fn label(self) -> &'static str {
+        match self {
+            BackupRestoreKind::Live => "首写备份",
+            BackupRestoreKind::Manual => "手动备份",
         }
     }
 }
@@ -420,6 +457,10 @@ pub struct SwitchApp {
     pub(crate) config_dir_inputs: std::collections::BTreeMap<String, gpui::Entity<crate::text_field::TextField>>,
     /// 配置目录覆盖操作状态。
     pub(crate) config_dir_status: String,
+    /// 备份管理操作状态。
+    pub(crate) backup_status: String,
+    /// 待确认的备份恢复（来源、路径、显示名）。
+    pub(crate) backup_restore_pending: Option<(BackupRestoreKind, String, String)>,
     /// 设置页当前分区。
     pub(crate) settings_section: SettingsSection,
     /// 通用供应商对话框打开。
@@ -587,6 +628,8 @@ impl SwitchApp {
             provider_mode: ProviderMode::Direct,
             config_dir_inputs: Default::default(),
             config_dir_status: String::new(),
+            backup_status: String::new(),
+            backup_restore_pending: None,
             settings_section: SettingsSection::General,
             universal_open: false,
             universal_edit: None,
@@ -1494,14 +1537,17 @@ impl SwitchApp {
                                     .on_click(cx.listener(Self::export_providers)),
                             )
                             .child(
+                                widgets::ghost_button("page-import-current", "从当前配置导入")
+                                    .on_click(cx.listener(Self::import_current_provider)),
+                            )
+                            .child(
                                 widgets::ghost_button("page-import", "导入")
                                     .on_click(cx.listener(Self::import_providers)),
                             )
                             .child(
                                 widgets::primary_button("page-add", "＋ 添加供应商")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_open = true;
-                                        cx.notify();
+                                        this.open_add_dialog(cx);
                                     })),
                             ),
                     ),
@@ -1853,6 +1899,74 @@ impl SwitchApp {
         .detach();
     }
 
+    /// 从当前客户端 live 配置导入为供应商（Claude/Desktop/Codex/Gemini/Grok）。
+    fn import_current_provider(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tool = self.active_tool;
+        let cdirs = self.config_dirs();
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            self.status = "无法定位 HOME".into();
+            self.status_tone = StatusTone::Error;
+            cx.notify();
+            return;
+        };
+        let imported = match crate::switch_engine::import_current_config(tool, &home, &cdirs) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status = format!("导入当前配置失败: {e}");
+                self.status_tone = StatusTone::Error;
+                cx.notify();
+                return;
+            }
+        };
+        let api_format = match tool {
+            Tool::Codex => Some("openai_chat".to_string()),
+            Tool::Gemini => Some("gemini_native".to_string()),
+            _ => None,
+        };
+        let mut provider = ns_presets::Provider::with_id(
+            format!("{}-import-{}", tool.id_str(), now_ts_suffix()),
+            format!("{} 当前配置", tool.label()),
+            imported.settings_config(tool),
+        );
+        provider.category = Some(ns_presets::ProviderCategory::Custom);
+        provider.meta = Some(ns_presets::ProviderMeta {
+            api_format,
+            ..Default::default()
+        });
+        provider.icon = Some("api".to_string());
+        provider.icon_color = Some("#c9a25f".to_string());
+        let saved = self
+            .store
+            .write()
+            .expect("store lock")
+            .add_provider(provider);
+        match saved {
+            Ok(()) => {
+                self.status = format!(
+                    "已导入 {} 当前配置（端点 {}，模型 {}）",
+                    tool.label(),
+                    imported.endpoint,
+                    if imported.model.is_empty() {
+                        "默认"
+                    } else {
+                        imported.model.as_str()
+                    },
+                );
+                self.status_tone = StatusTone::Success;
+            }
+            Err(e) => {
+                self.status = format!("导入当前配置失败: {e}");
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
     /// 一键切换到目标供应商：写 live 配置 + 更新 current。
     fn switch_to_provider(&mut self, id: &str, cx: &mut Context<Self>) {
         let tool = self.active_tool;
@@ -1946,13 +2060,21 @@ impl SwitchApp {
                         } else {
                             "；已热切换（下次命令生效）".to_string()
                         };
-                        format!(
-                            "已切换到 {}（写入 {} 个文件{}）{}",
-                            provider.name,
-                            outcome.written,
-                            if outcome.noop { "，无内容变化" } else { "" },
-                            restart_hint,
-                        )
+                        if outcome.has_no_live_files() {
+                            format!(
+                                "已选择 {}（{} 无独立客户端配置文件，仅记录当前选择）",
+                                provider.name,
+                                tool.label()
+                            )
+                        } else {
+                            format!(
+                                "已切换到 {}（写入 {} 个文件{}）{}",
+                                provider.name,
+                                outcome.written,
+                                if outcome.noop { "，无内容变化" } else { "" },
+                                restart_hint,
+                            )
+                        }
                     }
                     Err(e) => format!("切换失败: {e}"),
                 };
@@ -2594,6 +2716,21 @@ impl SwitchApp {
                             .text_color(theme::text_dim())
                             .child("无会话日志（Claude/Codex/Gemini）")
                     } else {
+                        let total_requests: u64 =
+                            self.session_stats.iter().map(|s| s.requests).sum();
+                        let total_input: u64 =
+                            self.session_stats.iter().map(|s| s.input_tokens).sum();
+                        let total_output: u64 =
+                            self.session_stats.iter().map(|s| s.output_tokens).sum();
+                        let total_cache: u64 =
+                            self.session_stats.iter().map(|s| s.cache_read_tokens).sum();
+                        let total_cost: f64 = self
+                            .session_stats
+                            .iter()
+                            .filter_map(|s| s.cost_usd)
+                            .sum();
+                        let any_cost = self.session_stats.iter().any(|s| s.cost_usd.is_some());
+                        let model_count = self.session_stats.len();
                         div()
                             .flex_col()
                             .gap(px(4.))
@@ -2608,9 +2745,11 @@ impl SwitchApp {
                                             .flex_1()
                                             .child("模型"),
                                     )
-                                    .child(div().w(px(64.)).child("请求"))
-                                    .child(div().w(px(80.)).child("输入"))
-                                    .child(div().w(px(80.)).child("输出"))
+                                    .child(div().w(px(56.)).child("请求"))
+                                    .child(div().w(px(72.)).child("输入"))
+                                    .child(div().w(px(72.)).child("输出"))
+                                    .child(div().w(px(72.)).child("缓存读"))
+                                    .child(div().w(px(56.)).child("命中率"))
                                     .child(div().w(px(72.)).child("花费")),
                             )
                             .children(self.session_stats.iter().take(12).map(|s| {
@@ -2627,19 +2766,28 @@ impl SwitchApp {
                                     )
                                     .child(
                                         div()
-                                            .w(px(64.))
+                                            .w(px(56.))
                                             .child(s.requests.to_string()),
                                     )
                                     .child(
                                         div()
-                                            .w(px(80.))
+                                            .w(px(72.))
                                             .child(format_tokens(s.input_tokens)),
                                     )
                                     .child(
                                         div()
-                                            .w(px(80.))
+                                            .w(px(72.))
                                             .child(format_tokens(s.output_tokens)),
                                     )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .child(format_tokens(s.cache_read_tokens)),
+                                    )
+                                    .child(div().w(px(56.)).child(format!(
+                                        "{:.0}%",
+                                        cache_hit_rate(s.cache_read_tokens, s.input_tokens)
+                                    )))
                                     .child(
                                         div()
                                             .w(px(72.))
@@ -2650,6 +2798,53 @@ impl SwitchApp {
                                             ),
                                     )
                             }))
+                            .child(
+                                div()
+                                    .mt(px(4.))
+                                    .pt(px(6.))
+                                    .border_t_1()
+                                    .border_color(theme::stroke_a(0.12))
+                                    .flex()
+                                    .gap(px(10.))
+                                    .text_size(px(11.))
+                                    .text_color(theme::text())
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .child(format!("合计（{model_count} 个模型）")),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(56.))
+                                            .child(total_requests.to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .child(format_tokens(total_input)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .child(format_tokens(total_output)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .child(format_tokens(total_cache)),
+                                    )
+                                    .child(div().w(px(56.)).child(format!(
+                                        "{:.0}%",
+                                        cache_hit_rate(total_cache, total_input)
+                                    )))
+                                    .child(
+                                        div().w(px(72.)).child(if any_cost {
+                                            format!("${total_cost:.4}")
+                                        } else {
+                                            "—".to_string()
+                                        }),
+                                    ),
+                            )
                     })
                     .child(
                         div()
@@ -3029,6 +3224,8 @@ impl SwitchApp {
         };
         let collapsed = &self.session_collapsed;
         let session_id = meta.id.clone();
+        let sid_recover = session_id.clone();
+        let sid_terminal = session_id.clone();
         div()
             .id("session-view")
             .flex_1()
@@ -3092,6 +3289,26 @@ impl SwitchApp {
                                         ),
                                     )
                                     .child(
+                                        widgets::ghost_button(("sess-copy-all", 0usize), "复制整段").on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                let Some(meta) = this.session_meta.clone() else {
+                                                    return;
+                                                };
+                                                let md = ns_sessions::export_markdown(
+                                                    &meta,
+                                                    &this.session_rounds,
+                                                );
+                                                cx.write_to_clipboard(
+                                                    ClipboardItem::new_string(md.clone()),
+                                                );
+                                                this.status =
+                                                    format!("已复制整段会话（{} 字符）", md.chars().count());
+                                                this.status_tone = StatusTone::Success;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
                                         widgets::ghost_button(("sess-recover", 0usize), "恢复命令").on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 let tool = this
@@ -3099,8 +3316,32 @@ impl SwitchApp {
                                                     .as_ref()
                                                     .map(|m| m.tool.as_str())
                                                     .unwrap_or("claude");
-                                                let cmd = ns_sessions::recover_command_for(tool, &session_id);
+                                                let cmd = ns_sessions::recover_command_for(tool, &sid_recover);
                                                 this.status = cmd.clone();
+                                                this.status_tone = StatusTone::Neutral;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(("sess-restore-terminal", 0usize), "在终端恢复").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                let tool = this
+                                                    .session_meta
+                                                    .as_ref()
+                                                    .map(|m| m.tool.as_str())
+                                                    .unwrap_or("claude");
+                                                let cmd = ns_sessions::recover_command_for(tool, &sid_terminal);
+                                                match run_terminal_command(&cmd) {
+                                                    Ok(()) => {
+                                                        this.status = format!("已在终端恢复会话：{cmd}");
+                                                        this.status_tone = StatusTone::Success;
+                                                    }
+                                                    Err(e) => {
+                                                        this.status = format!("打开终端失败: {e}；可手动执行：{cmd}");
+                                                        this.status_tone = StatusTone::Error;
+                                                    }
+                                                }
                                                 cx.notify();
                                             }),
                                         ),
@@ -3126,6 +3367,7 @@ impl SwitchApp {
                                 } else {
                                     theme::TEXT_DIM
                                 };
+                                let round_md = ns_sessions::round_markdown(r);
                                 div()
                                     .id(("round", i))
                                     .flex_col()
@@ -3152,6 +3394,22 @@ impl SwitchApp {
                                                         r.file_changes,
                                                         if r.failed { " · 失败" } else { "" }
                                                     )),
+                                            )
+                                            .child(
+                                                widgets::ghost_button(("round-copy", i), "复制本轮").on_click(
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(round_md.clone()),
+                                                        );
+                                                        this.status = format!(
+                                                            "已复制第 {} 轮（{} 字符）",
+                                                            i + 1,
+                                                            round_md.chars().count()
+                                                        );
+                                                        this.status_tone = StatusTone::Success;
+                                                        cx.notify();
+                                                    }),
+                                                ),
                                             )
                                             .child(
                                                 widgets::ghost_button(("round-toggle", i), if is_open { "收起" } else { "展开" }).on_click(
@@ -3268,6 +3526,7 @@ impl SwitchApp {
                         .find(|p| p.id == *preset_id)
                 {
                     let fields = crate::dialog::DialogFields {
+                        name: preset.name.to_string(),
                         endpoint: endpoint.clone(),
                         key: key.clone(),
                         model: model.clone(),
@@ -3482,13 +3741,15 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
     /// 检测添加/编辑对话框是否有未保存修改（字段与初始快照比对）。
     pub(crate) fn dialog_is_dirty(&self, cx: &mut Context<Self>) -> bool {
         let f = &self.dialog_fields;
+        let name = self.dialog_inputs.name.read(cx).text();
         let endpoint = self.dialog_inputs.endpoint.read(cx).text();
         let key = self.dialog_inputs.key.read(cx).text();
         let model = self.dialog_inputs.model.read(cx).text();
         let usage = self.dialog_inputs.usage_script.read(cx).text();
         let icon = self.dialog_inputs.icon.read(cx).text();
         let icon_color = self.dialog_inputs.icon_color.read(cx).text();
-        endpoint != f.endpoint
+        name != f.name
+            || endpoint != f.endpoint
             || key != f.key
             || model != f.model
             || usage != f.usage_script
@@ -3498,7 +3759,9 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
 
     /// Esc：关闭当前打开的对话框/菜单。
     fn escape_dialog(&mut self, cx: &mut Context<Self>) {
-        if self.pending_switch.is_some() {
+        if self.backup_restore_pending.is_some() {
+            self.backup_restore_pending = None;
+        } else if self.pending_switch.is_some() {
             self.pending_switch = None;
             self.status = "已取消切换".into();
             self.status_tone = StatusTone::Neutral;
@@ -3515,6 +3778,8 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             self.edit_id = None;
         } else if self.open_menu.is_some() {
             self.open_menu = None;
+        } else if self.mcp.sync_targets_open.is_some() {
+            self.mcp.sync_targets_open = None;
         } else if self.mcp.dialog_open {
             self.mcp.dialog_open = false;
         } else if self.mcp.scope_open {
@@ -5693,6 +5958,11 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
         );
         let status = self.update_status.clone();
         let backups = self.store.read().map(|s| s.list_backups()).unwrap_or_default();
+        let manual_backups = self
+            .store
+            .read()
+            .map(|s| s.list_manual_backups())
+            .unwrap_or_default();
         // 环境冲突告警：路由模式下多工具共用同一监听端口。
         let conflicts: Vec<String> = {
             let s = self.store.read().expect("store lock");
@@ -6377,10 +6647,27 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                     .border_color(theme::stroke_a(0.08))
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child("备份与环境"),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(13.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child("备份与环境"),
+                            )
+                            .child(
+                                widgets::ghost_button("backup-now", "立即备份").on_click(
+                                    cx.listener(|this, _, _, cx| this.create_manual_backup(cx)),
+                                ),
+                            )
+                            .child(
+                                widgets::ghost_button("backup-open-dir", "打开备份目录").on_click(
+                                    cx.listener(|this, _, _, cx| this.open_backups_folder(cx)),
+                                ),
+                            ),
                     )
                     .child(if conflicts.is_empty() {
                         div()
@@ -6393,17 +6680,24 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                             .text_color(theme::danger())
                             .child(conflicts.join("；"))
                     })
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(format!("首写备份（{}）", backups.len())),
+                    )
                     .child(if backups.is_empty() {
                         div()
                             .text_size(px(11.))
                             .text_color(theme::text_faint())
-                            .child("无首写备份")
+                            .child("无首写备份（首次切换供应商时自动生成）")
                     } else {
                         div()
                             .flex_col()
                             .gap(px(4.))
                             .children(backups.into_iter().enumerate().map(|(i, b)| {
                                 let bp = b.path.clone();
+                                let label = b.name.clone();
                                 div()
                                     .id(("backup-row", i))
                                     .flex()
@@ -6419,20 +6713,68 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                                     .child(
                                         widgets::ghost_button(("backup-restore", i), "恢复").on_click(
                                             cx.listener(move |this, _, _, cx| {
-                                                let ok = {
-                                                    let s = this.store.read().expect("store lock");
-                                                    s.restore_backup(&bp).is_ok()
-                                                };
-                                                this.status = if ok {
-                                                    format!("已恢复 {bp}")
-                                                } else {
-                                                    "恢复备份失败".into()
-                                                };
+                                                this.backup_restore_pending = Some((
+                                                    BackupRestoreKind::Live,
+                                                    bp.clone(),
+                                                    label.clone(),
+                                                ));
                                                 cx.notify();
                                             }),
                                         ),
                                     )
                             }))
+                    })
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(format!("手动备份（{}）", manual_backups.len())),
+                    )
+                    .child(if manual_backups.is_empty() {
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child("暂无手动备份（点「立即备份」保存当前配置）")
+                    } else {
+                        div()
+                            .flex_col()
+                            .gap(px(4.))
+                            .children(manual_backups.into_iter().enumerate().map(|(i, b)| {
+                                let bp = b.path.clone();
+                                let label = b.name.clone();
+                                div()
+                                    .id(("manual-backup-row", i))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_size(px(11.))
+                                            .text_color(theme::text_dim())
+                                            .child(format!("{} · {} B", b.name, b.size)),
+                                    )
+                                    .child(
+                                        widgets::ghost_button(("manual-backup-restore", i), "恢复").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.backup_restore_pending = Some((
+                                                    BackupRestoreKind::Manual,
+                                                    bp.clone(),
+                                                    label.clone(),
+                                                ));
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                            }))
+                    })
+                    .when(!self.backup_status.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::accent())
+                                .child(self.backup_status.clone()),
+                        )
                     })
                 )
             })
@@ -8291,19 +8633,7 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
 
     /// 渲染 M7 统一 MCP 面板。
     fn render_mcp_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        const MCP_TOOLS: [Tool; 11] = [
-            Tool::Claude,
-            Tool::Codex,
-            Tool::Gemini,
-            Tool::Opencode,
-            Tool::GrokBuild,
-            Tool::Kimi,
-            Tool::Openclaw,
-            Tool::Hermes,
-            Tool::Pi,
-            Tool::Mcode,
-            Tool::Omp,
-        ];
+        let mcp_tools = crate::mcp::MCP_TOOLS;
         let tool = self.mcp.tool;
         let servers = self.mcp.servers.clone();
         let status = self.mcp.status.clone();
@@ -8356,7 +8686,7 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                                 widgets::ghost_button(("mcp-import", 0usize), "从其他工具导入").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         // 导入来源：取另一个支持 MCP 的工具（首个与当前不同者）。
-                                        let source = MCP_TOOLS
+                                        let source = crate::mcp::MCP_TOOLS
                                             .iter()
                                             .copied()
                                             .find(|&t| t != this.mcp.tool)
@@ -8397,7 +8727,7 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .children(MCP_TOOLS.iter().enumerate().map(|(i, &t)| {
+                    .children(mcp_tools.iter().enumerate().map(|(i, &t)| {
                         let selected = t == tool;
                         div()
                             .id(("mcp-tool", i))
@@ -8539,15 +8869,10 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                                         }),
                                     )
                                     .child(
-                                        widgets::ghost_button(("mcp-sync", i), "同步").on_click({
+                                        widgets::ghost_button(("mcp-sync", i), "同步到…").on_click({
                                             let sn = sname.clone();
                                             cx.listener(move |this, _, _, cx| {
-                                                let others: Vec<Tool> = MCP_TOOLS
-                                                    .iter()
-                                                    .copied()
-                                                    .filter(|&t| t != this.mcp.tool)
-                                                    .collect();
-                                                this.mcp.sync_to(&sn, &others, cx);
+                                                this.mcp.open_sync_targets(&sn, cx);
                                             })
                                         }),
                                     )
@@ -8581,6 +8906,11 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             })
             .child(if let Some(name) = confirm_delete {
                 self.render_mcp_confirm_delete(&name, cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.mcp.sync_targets_open.is_some() {
+                self.render_mcp_sync_targets(cx).into_any_element()
             } else {
                 div().into_any_element()
             })
@@ -8896,6 +9226,135 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                             ),
                     ),
             )
+    }
+
+    /// MCP 同步目标选择浮层（勾选目标工具后同步，默认全选）。
+    fn render_mcp_sync_targets(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(name) = self.mcp.sync_targets_open.clone() else {
+            return div().into_any_element();
+        };
+        let current = self.mcp.tool;
+        let targets: Vec<(Tool, bool)> = crate::mcp::MCP_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| *t != current)
+            .map(|t| {
+                let on = self
+                    .mcp
+                    .sync_target_selected
+                    .get(t.id_str())
+                    .copied()
+                    .unwrap_or(false);
+                (t, on)
+            })
+            .collect();
+        div()
+            .id("mcp-sync-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.55))
+            .child(
+                div()
+                    .id("mcp-sync-targets")
+                    .w(px(420.))
+                    .flex_col()
+                    .gap(px(12.))
+                    .p(px(20.))
+                    .rounded(px(14.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("同步 MCP 服务器"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_dim())
+                            .child(format!(
+                                "将「{name}」从 {} 同步到所选工具（只改目标工具的 mcpServers/mcp_servers）：",
+                                current.label()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("mcp-sync-all", "全选").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.set_all_sync_targets(true, cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::ghost_button("mcp-sync-none", "全不选").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.set_all_sync_targets(false, cx);
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(px(6.))
+                            .children(targets.into_iter().enumerate().map(|(i, (t, on))| {
+                                div()
+                                    .id(("mcp-sync-target", i))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .cursor_pointer()
+                                    .child(
+                                        widgets::pill(
+                                            if on { "☑" } else { "☐" },
+                                            if on { theme::jade() } else { theme::text_faint() },
+                                        )
+                                        .id(("mcp-sync-check", i)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(theme::text())
+                                            .child(t.label()),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.mcp.toggle_sync_target(t, cx);
+                                    }))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("mcp-sync-cancel", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.sync_targets_open = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button("mcp-sync-confirm", "同步").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.mcp.confirm_sync_targets(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// 渲染 M7 统一 Skills 面板。
@@ -10849,7 +11308,7 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
         }
     }
 
-    fn render_empty_state(&self, _cx: &mut Context<Self>) -> Div {
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> Div {
         div()
             .flex_1()
             .flex()
@@ -10888,9 +11347,8 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             )
             .child(
                 widgets::ghost_button("empty-add", "＋ 添加供应商")
-                    .on_click(_cx.listener(|this, _, _, cx| {
-                        this.add_open = true;
-                        cx.notify();
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_add_dialog(cx);
                     })),
             )
     }
@@ -11525,19 +11983,26 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                             "-m",
                             "8",
                             "-w",
-                            "%{http_code}",
+                            "%{http_code} %{time_total}",
                             "-I",
                             &url,
                         ])
                         .output();
                     match out {
                         Ok(o) => {
-                            let code = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            let raw = String::from_utf8_lossy(&o.stdout);
+                            let mut parts = raw.split_whitespace();
+                            let code = parts.next().unwrap_or_default().to_string();
+                            let secs = parts
+                                .next()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let latency = format!("{} ms", (secs * 1000.0).round() as u64);
                             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
                             if (o.status.success() || !code.is_empty()) && code != "000" {
-                                Ok(format!("HTTP {code} · {url}"))
+                                Ok(format!("HTTP {code} · {latency} · {url}"))
                             } else if err.is_empty() {
-                                Err(format!("无法连接 · {url}"))
+                                Err(format!("无法连接 · {latency} · {url}"))
                             } else {
                                 Err(format!("{err} · {url}"))
                             }
@@ -11605,17 +12070,7 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             return Some(std::path::PathBuf::from(d));
         }
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
-        Some(match tool {
-            ns_presets::Tool::Claude => home.join(".claude"),
-            ns_presets::Tool::Codex => home.join(".codex"),
-            ns_presets::Tool::Gemini => home.join(".gemini"),
-            ns_presets::Tool::Opencode => home.join(".config").join("opencode"),
-            ns_presets::Tool::Openclaw => home.join(".openclaw"),
-            ns_presets::Tool::Hermes => home.join(".hermes"),
-            ns_presets::Tool::Pi => home.join(".pi").join("agent"),
-            ns_presets::Tool::Kimi => home.join(".kimi"),
-            _ => home.join(format!(".{}", tool.id_str())),
-        })
+        Some(tool.default_config_dir(&home))
     }
 
     fn open_tool_config_terminal(&mut self, _id: &str, cx: &mut Context<Self>) {
@@ -11659,6 +12114,156 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             Err(e) => self.status = format!("打开终端失败：{e}"),
         }
         cx.notify();
+    }
+
+    /// 立即备份 `config.json` 到 `~/.ns-switch/backups/manual/`。
+    fn create_manual_backup(&mut self, cx: &mut Context<Self>) {
+        let r = self.store.read().expect("store lock").manual_backup();
+        match r {
+            Ok(p) => {
+                self.backup_status = format!("已备份配置 → {}", p.display());
+                self.status = self.backup_status.clone();
+                self.status_tone = StatusTone::Success;
+            }
+            Err(e) => {
+                self.backup_status = format!("备份失败：{e}");
+                self.status = self.backup_status.clone();
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 在系统文件管理器中打开备份根目录。
+    fn open_backups_folder(&mut self, cx: &mut Context<Self>) {
+        let dir = self.store.read().expect("store lock").backups_root();
+        let _ = std::fs::create_dir_all(&dir);
+        match open_folder(&dir) {
+            Ok(()) => {
+                self.backup_status = format!("已打开备份目录：{}", dir.display());
+                self.status = self.backup_status.clone();
+                self.status_tone = StatusTone::Neutral;
+            }
+            Err(e) => {
+                self.backup_status = format!("打开备份目录失败：{e}");
+                self.status = self.backup_status.clone();
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 执行待确认的备份恢复（首写备份写回原文件 / 手动备份覆盖 config.json）。
+    fn confirm_backup_restore(&mut self, cx: &mut Context<Self>) {
+        let Some((kind, path, name)) = self.backup_restore_pending.take() else {
+            return;
+        };
+        let result = match kind {
+            BackupRestoreKind::Live => self
+                .store
+                .read()
+                .expect("store lock")
+                .restore_backup(&path)
+                .map(|_| String::new()),
+            BackupRestoreKind::Manual => self
+                .store
+                .write()
+                .expect("store lock")
+                .restore_manual_backup(&path)
+                .map(|_| "（配置已重新载入）".to_string()),
+        };
+        match result {
+            Ok(suffix) => {
+                self.backup_status = format!("已从{}恢复：{name}{suffix}", kind.label());
+                self.status = self.backup_status.clone();
+                self.status_tone = StatusTone::Success;
+            }
+            Err(e) => {
+                self.backup_status = format!("恢复失败：{e}");
+                self.status = self.backup_status.clone();
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 备份恢复确认浮层（恢复会覆盖现有文件，先确认）。
+    fn render_backup_restore_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (kind, _, name) = self
+            .backup_restore_pending
+            .clone()
+            .expect("backup_restore_pending 非空");
+        let (title, detail) = match kind {
+            BackupRestoreKind::Live => (
+                "恢复首写备份",
+                "将把备份内容写回对应的工具客户端配置文件，当前 live 配置会被覆盖。",
+            ),
+            BackupRestoreKind::Manual => (
+                "恢复手动备份",
+                "将用该备份覆盖 ~/.ns-switch/config.json（供应商/设置/路由），当前配置会先存到 backups/pre-restore/。",
+            ),
+        };
+        div()
+            .id("backup-restore-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("backup-restore-confirm")
+                    .w(px(460.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!("{detail}\n备份：{name}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::cinnabar())
+                            .child("⚠ 恢复后建议重启对应工具（Codex/Gemini/Grok/Claude 桌面版需重启）。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("backup-restore-cancel", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.backup_restore_pending = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button("backup-restore-go", "确认恢复").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirm_backup_restore(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
     }
 
     fn duplicate_provider(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -11786,6 +12391,26 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
         cx.notify();
     }
 
+    /// 打开「添加供应商」对话框：清空上次编辑残留的表单与预设选择。
+    fn open_add_dialog(&mut self, cx: &mut Context<Self>) {
+        self.add_open = true;
+        self.edit_id = None;
+        self.dialog_preset = None;
+        self.dialog_fields = dialog::DialogFields::default();
+        let name = self.dialog_inputs.name.clone();
+        let endpoint = self.dialog_inputs.endpoint.clone();
+        let key = self.dialog_inputs.key.clone();
+        let model = self.dialog_inputs.model.clone();
+        let usage = self.dialog_inputs.usage_script.clone();
+        let icon = self.dialog_inputs.icon.clone();
+        let icon_color = self.dialog_inputs.icon_color.clone();
+        let search = self.dialog_inputs.search.clone();
+        for field in [&name, &endpoint, &key, &model, &usage, &icon, &icon_color, &search] {
+            field.update(cx, |f, _| f.set_text(""));
+        }
+        cx.notify();
+    }
+
     fn open_edit_dialog(&mut self, id: &str, cx: &mut Context<Self>) {
         let provider = {
             let store = self.store.read().expect("store lock");
@@ -11811,6 +12436,10 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
         self.dialog_preset = Some(preset.id.to_string());
         self.dialog_fields = dialog::DialogFields::from_provider(&p);
         // 预填输入框（先克隆，避免同时借用 self 字段）。
+        let name = self.dialog_fields.name.clone();
+        self.dialog_inputs
+            .name
+            .update(cx, |f, _| f.set_text(&name));
         let endpoint = self.dialog_fields.endpoint.clone();
         let key = self.dialog_fields.key.clone();
         let model = self.dialog_fields.model.clone();
@@ -12110,88 +12739,6 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
             .into_any_element()
     }
 
-    /// 写入冲突确认浮层：确认后强制执行切换，取消则放弃。
-    fn render_switch_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some((tool, provider, note)) = self.pending_switch.clone() else {
-            return div().into_any_element();
-        };
-        div()
-            .id("switch-confirm-overlay")
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::color(0x000000).opacity(0.6))
-            .child(
-                div()
-                    .id("switch-confirm")
-                    .w(px(440.))
-                    .flex_col()
-                    .gap(px(14.))
-                    .p(px(22.))
-                    .rounded(px(16.))
-                    .bg(theme::panel())
-                    .border_1()
-                    .border_color(theme::stroke_a(0.3))
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(theme::text())
-                            .child("切换冲突确认"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .text_color(theme::text())
-                            .child(format!(
-                                "即将切换到 {}（{}），但检测到目标配置被占用/修改。",
-                                provider.name,
-                                tool.label()
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(theme::cinnabar())
-                            .child(format!("⚠ {}", note)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme::text_dim())
-                            .child("继续写入会覆盖这些字段；首次改写前的配置已自动备份。"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.))
-                            .child(
-                                widgets::ghost_button(("switch-confirm-cancel", 0usize), "取消")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.pending_switch = None;
-                                        this.status = "已取消切换".into();
-                                        this.status_tone = StatusTone::Neutral;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                widgets::primary_button(("switch-confirm-ok", 0usize), "继续切换")
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.pending_switch = None;
-                                            this.apply_switch(tool, &provider, cx);
-                                        },
-                                    )),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// 通用供应商删除确认浮层。
     fn render_universal_confirm_delete(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(id) = self.universal_confirm_delete.clone() else {
@@ -12412,7 +12959,6 @@ impl Render for SwitchApp {
             })
             .child(self.render_confirm_delete(cx))
             .child(self.render_dialog_confirm_close(cx))
-            .child(self.render_switch_confirm(cx))
             .child(if self.open_menu.as_deref() == Some("project") {
                 self.render_project_menu(cx).into_any_element()
             } else {
@@ -12465,12 +13011,39 @@ impl Render for SwitchApp {
             } else {
                 div().into_any_element()
             })
+            .child(if self.backup_restore_pending.is_some() {
+                self.render_backup_restore_confirm(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
             .child(if self.deeplink_pending.is_some() {
                 self.render_deeplink_confirm(cx).into_any_element()
             } else {
                 div().into_any_element()
             })
 }
+}
+
+/// 用系统文件管理器打开目录（跨平台）。
+fn open_folder(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ());
+    #[cfg(target_os = "linux")]
+    let r = std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ());
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .map(|_| ());
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let r: std::io::Result<()> = Err(std::io::Error::other("unsupported platform"));
+    r
 }
 
 /// 从存储快照构建托盘菜单条目（每工具列出供应商，标记当前）。
@@ -12685,7 +13258,7 @@ fn icon_glyph(icon_id: &str, fallback: char) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_tokens, icon_glyph, is_coding_plan};
+    use super::{cache_hit_rate, format_tokens, icon_glyph, is_coding_plan};
 
     #[test]
     fn coding_plan_detection() {
@@ -12712,6 +13285,15 @@ mod tests {
         assert_eq!(format_tokens(1500), "1.5k");
         assert_eq!(format_tokens(2_000_000), "2.0M");
         assert_eq!(format_tokens(26_274_810), "26.3M");
+    }
+
+    #[test]
+    fn cache_hit_rate_counts_cache_in_prompt() {
+        assert_eq!(cache_hit_rate(0, 0), 0.0);
+        assert_eq!(cache_hit_rate(0, 100), 0.0);
+        assert!((cache_hit_rate(100, 100) - 50.0).abs() < f64::EPSILON);
+        assert!((cache_hit_rate(900, 100) - 90.0).abs() < f64::EPSILON);
+        assert!((cache_hit_rate(250, 750) - 25.0).abs() < f64::EPSILON);
     }
 }
 

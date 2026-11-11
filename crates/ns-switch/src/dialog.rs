@@ -8,6 +8,8 @@ use crate::app::StatusTone;
 /// 对话框字段输入。
 #[derive(Debug, Clone, Default)]
 pub struct DialogFields {
+    /// 供应商显示名（可自定义；空 = 用预设名）。
+    pub name: String,
     pub endpoint: String,
     pub key: String,
     pub model: String,
@@ -26,6 +28,7 @@ impl DialogFields {
     /// 从预设构建字段（endpoint 留空由预设/用户填）。
     pub fn from_preset(preset: &Preset) -> Self {
         let mut f = Self::default();
+        f.name = preset.name.to_string();
         f.model = preset_default_model(preset);
         f.api_format = preset.api_format.to_string();
         f.icon = preset.icon.to_string();
@@ -36,39 +39,105 @@ impl DialogFields {
 
     /// 从已有供应商读取可编辑字段（编辑对话框预填）。
     /// 扫描 `settings_config` 顶层与嵌套对象（`env`/`auth`/`config`），
-    /// 按关键字启发式恢复 endpoint/key/model。
+    /// 先按精确键名匹配，再退回关键字包含匹配（排除 `model_provider`
+    /// 这类语义不同但名字相近的键），避免把协议选择器误当成模型名。
     pub fn from_provider(p: &Provider) -> Self {
-        fn find(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        fn exact(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
             match value {
                 serde_json::Value::Object(map) => {
                     for (k, v) in map {
                         if let Some(s) = v.as_str() {
                             if !s.is_empty()
-                                && keys.iter().any(|k2| {
-                                    k.to_lowercase().contains(&k2.to_lowercase())
-                                })
+                                && keys.iter().any(|k2| k.eq_ignore_ascii_case(k2))
                             {
                                 return Some(s.to_string());
                             }
                         }
                     }
-                    map.values().find_map(|v| find(v, keys))
+                    map.values().find_map(|v| exact(v, keys))
                 }
                 _ => None,
             }
         }
+        fn fuzzy(
+            value: &serde_json::Value,
+            keys: &[&str],
+            exclude: &[&str],
+        ) -> Option<String> {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (k, v) in map {
+                        let lk = k.to_lowercase();
+                        if let Some(s) = v.as_str() {
+                            if !s.is_empty()
+                                && !exclude.iter().any(|e| lk.contains(e))
+                                && keys.iter().any(|k2| lk.contains(&k2.to_lowercase()))
+                            {
+                                return Some(s.to_string());
+                            }
+                        }
+                    }
+                    map.values().find_map(|v| fuzzy(v, keys, exclude))
+                }
+                _ => None,
+            }
+        }
+        fn find(
+            value: &serde_json::Value,
+            exact_keys: &[&str],
+            fuzzy_keys: &[&str],
+            exclude: &[&str],
+        ) -> String {
+            exact(value, exact_keys)
+                .or_else(|| fuzzy(value, fuzzy_keys, exclude))
+                .unwrap_or_default()
+        }
         let cfg = &p.settings_config;
         Self {
-            endpoint: find(cfg, &["endpoint", "base_url", "baseUrl", "url", "BASE_URL"]).unwrap_or_default(),
+            name: p.name.clone(),
+            endpoint: find(
+                cfg,
+                &[
+                    "base_url",
+                    "baseUrl",
+                    "ANTHROPIC_BASE_URL",
+                    "GEMINI_BASE_URL",
+                    "OPENAI_BASE_URL",
+                    "endpoint",
+                    "url",
+                ],
+                &["endpoint", "base_url", "baseurl", "url"],
+                &[],
+            ),
             key: find(
                 cfg,
                 &[
-                    "api_key", "apiKey", "key", "token", "auth_token", "AUTH_TOKEN", "API_KEY",
-                    "api_token",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                    "OPENAI_API_KEY",
+                    "GEMINI_API_KEY",
+                    "GOOGLE_API_KEY",
+                    "experimental_bearer_token",
+                    "api_key",
+                    "apiKey",
+                    "auth_token",
+                    "token",
                 ],
-            )
-            .unwrap_or_default(),
-            model: find(cfg, &["model", "default_model", "defaultModel", "MODEL"]).unwrap_or_default(),
+                &["api_key", "apikey", "auth_token", "token", "key"],
+                &["header"],
+            ),
+            model: find(
+                cfg,
+                &[
+                    "model",
+                    "default_model",
+                    "defaultModel",
+                    "ANTHROPIC_MODEL",
+                    "GEMINI_MODEL",
+                ],
+                &["model"],
+                &["provider", "providers", "catalog", "models", "effort"],
+            ),
             usage_script: p
                 .meta
                 .as_ref()
@@ -92,6 +161,7 @@ impl DialogFields {
 /// 对话框输入实体（真实可编辑文本域）。
 pub struct DialogInputs {
     pub search: gpui::Entity<crate::text_field::TextField>,
+    pub name: gpui::Entity<crate::text_field::TextField>,
     pub endpoint: gpui::Entity<crate::text_field::TextField>,
     pub key: gpui::Entity<crate::text_field::TextField>,
     pub model: gpui::Entity<crate::text_field::TextField>,
@@ -106,6 +176,7 @@ impl DialogInputs {
     ) -> Self {
         Self {
             search: cx.new(|cx| crate::text_field::TextField::new("搜索预设…", cx)),
+            name: cx.new(|cx| crate::text_field::TextField::new("供应商名称", cx)),
             endpoint: cx.new(|cx| crate::text_field::TextField::new("https://…", cx)),
             key: cx.new(|cx| crate::text_field::TextField::new("sk-…", cx)),
             model: cx.new(|cx| crate::text_field::TextField::new("模型名", cx)),
@@ -156,6 +227,22 @@ pub fn add_dialog(
         )
 }
 
+/// 关闭对话框：有未保存修改时先弹守卫浮层（✕ / 取消 / Esc 共用）。
+fn request_close(
+    app: &mut crate::app::SwitchApp,
+    cx: &mut Context<crate::app::SwitchApp>,
+) {
+    if app.dialog_is_dirty(cx) {
+        app.dialog_dirty = true;
+        cx.notify();
+        return;
+    }
+    app.add_open = false;
+    app.edit_id = None;
+    app.dialog_preset = None;
+    cx.notify();
+}
+
 fn dialog_header(
     tool: ns_presets::Tool,
     editing: bool,
@@ -182,17 +269,7 @@ fn dialog_header(
                 .child(title),
         )
         .child(widgets::ghost_button("dlg-close", "✕").on_click(cx.listener(
-            |this, _, _, cx| {
-                if this.dialog_is_dirty(cx) {
-                    this.dialog_dirty = true;
-                    cx.notify();
-                    return;
-                }
-                this.add_open = false;
-                this.edit_id = None;
-                this.dialog_preset = None;
-                cx.notify();
-            },
+            |this, _, _, cx| request_close(this, cx),
         )))
 }
 
@@ -250,6 +327,9 @@ fn preset_row(preset: &'static Preset, cx: &mut Context<crate::app::SwitchApp>) 
         .on_click(cx.listener(move |this, _, _, cx| {
             this.dialog_preset = Some(pid.clone());
             this.dialog_fields = DialogFields::from_preset(preset);
+            // 选择预设后回填名称；连接字段保持用户当前输入（同预设可只改 key）。
+            let name = this.dialog_fields.name.clone();
+            this.dialog_inputs.name.update(cx, |f, _| f.set_text(&name));
             cx.notify();
         }))
         .child(
@@ -290,7 +370,9 @@ fn form_and_preview(
     let endpoint = inputs.endpoint.read(cx).text();
     let key = inputs.key.read(cx).text();
     let model = inputs.model.read(cx).text();
+    let name = inputs.name.read(cx).text();
     let mut live_fields = fields.clone();
+    live_fields.name = name.clone();
     live_fields.endpoint = endpoint.clone();
     live_fields.key = key.clone();
     live_fields.model = model.clone();
@@ -312,6 +394,7 @@ fn form_and_preview(
                 .p(px(16.))
                 .flex_col()
                 .gap(px(10.))
+                .child(field_input("供应商名称", &inputs.name, cx))
                 .child(field_input("接口地址", &inputs.endpoint, cx))
                 .child(
                     div()
@@ -417,12 +500,7 @@ fn form_and_preview(
                 .justify_end()
                 .gap(px(8.))
                 .child(widgets::ghost_button("dlg-cancel", "取消").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.add_open = false;
-                        this.edit_id = None;
-                        this.dialog_preset = None;
-                        cx.notify();
-                    },
+                    |this, _, _, cx| request_close(this, cx),
                 )))
                 .child(
                     widgets::primary_button("dlg-save", save_label)
@@ -531,7 +609,11 @@ pub fn build_provider(
 ) -> Provider {
     Provider {
         id: format!("{}-{}", preset.id, crate::app::now_ts_suffix()),
-        name: preset.name.to_string(),
+        name: if fields.name.trim().is_empty() {
+            preset.name.to_string()
+        } else {
+            fields.name.trim().to_string()
+        },
         settings_config: (preset.build)(&fields.endpoint, &fields.key, &fields.model),
         website_url: preset.website_url.map(str::to_string),
         category: Some(preset.category),
@@ -617,18 +699,21 @@ pub fn save_provider(
             updated.name = provider.name.clone();
             updated.icon = provider.icon.clone();
             updated.icon_color = provider.icon_color.clone();
-            // 合并用量脚本路径与 API 格式（保留原 meta 其他字段）。
+            // 合并用量脚本路径、API 格式与用量开关（保留原 meta 其他字段）。
             {
                 let mut meta = updated.meta.take().unwrap_or_default();
-                if !fields.usage_script.is_empty() {
-                    meta.usage_script = Some(fields.usage_script.clone());
-                }
-                if !fields.api_format.is_empty() {
-                    meta.api_format = Some(fields.api_format.clone());
-                }
-                if meta.usage_script.is_some() || meta.api_format.is_some() || meta.models.is_some() {
-                    updated.meta = Some(meta);
-                }
+                meta.usage_script = if fields.usage_script.trim().is_empty() {
+                    None
+                } else {
+                    Some(fields.usage_script.trim().to_string())
+                };
+                meta.api_format = if fields.api_format.trim().is_empty() {
+                    None
+                } else {
+                    Some(fields.api_format.trim().to_string())
+                };
+                meta.usage_enabled = fields.usage_enabled;
+                updated.meta = Some(meta);
             }
             store.update_provider(updated)
         } else {
@@ -664,6 +749,7 @@ mod tests {
             .find(|p| p.id == "claude-88api")
             .expect("88api preset");
         let fields = DialogFields {
+            name: preset.name.to_string(),
             endpoint: "https://api.88api.com".into(),
             key: "sk-test".into(),
             model: "claude-sonnet-4-5".into(),
@@ -680,6 +766,31 @@ mod tests {
         // settings_config 含关键字段
         let cfg = &provider.settings_config;
         assert!(cfg.get("env").is_some());
+    }
+
+    #[test]
+    fn fields_from_provider_prefers_exact_model_key() {
+        // Codex 的 config 同时有 `model_provider = "custom"` 与 `model = "gpt-5"`；
+        // 旧实现按「包含 model」匹配会先取到 "custom"。
+        let provider = ns_presets::Provider::with_id(
+            "codex-custom-1".into(),
+            "My Codex".into(),
+            serde_json::json!({
+                "auth": { "OPENAI_API_KEY": "sk-codex" },
+                "config": {
+                    "model_provider": "custom",
+                    "model": "gpt-5",
+                    "model_providers": {
+                        "custom": { "base_url": "https://api.example.com", "wire_api": "chat" }
+                    }
+                }
+            }),
+        );
+        let f = DialogFields::from_provider(&provider);
+        assert_eq!(f.name, "My Codex");
+        assert_eq!(f.model, "gpt-5");
+        assert_eq!(f.endpoint, "https://api.example.com");
+        assert_eq!(f.key, "sk-codex");
     }
 
     #[test]

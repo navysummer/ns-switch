@@ -446,38 +446,65 @@ impl Store {
         self.dir.join("backups").join("live-first-write")
     }
 
+    /// 备份根目录（含首写备份、手动备份、同步冲突备份）。
+    pub fn backups_root(&self) -> PathBuf {
+        self.dir.join("backups")
+    }
+
     /// 列出 live 首写备份（按 mtime 新→旧）。
     pub fn list_backups(&self) -> Vec<BackupInfo> {
-        let dir = self.backups_dir();
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for e in entries.flatten() {
-            let path = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".source") {
-                continue;
-            }
-            let source = fs::read_to_string(format!("{}.source", path.display()))
-                .unwrap_or_default();
-            let meta = e.metadata().ok();
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            out.push(BackupInfo {
-                path: path.to_string_lossy().into_owned(),
-                source,
-                name,
-                size,
-                mtime,
-            });
+        scan_backups(&self.backups_dir(), None)
+    }
+
+    /// 手动备份 `config.json` 到 `backups/manual/`，返回备份文件路径。
+    ///
+    /// 配置文件尚未落盘时（首次运行）先序列化当前内存配置，避免产生空备份。
+    pub fn manual_backup(&self) -> Result<PathBuf> {
+        let dir = self.backups_root().join("manual");
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("创建备份目录失败: {}", dir.display()))?;
+        let path = dir.join(format!("config-{}.json", now_ts()));
+        if self.config_path.exists() {
+            fs::copy(&self.config_path, &path)
+                .with_context(|| format!("复制配置到备份失败: {}", path.display()))?;
+        } else {
+            atomic_write_json(&path, &self.config)?;
         }
-        out.sort_by_key(|b| std::cmp::Reverse(b.mtime));
-        out
+        Ok(path)
+    }
+
+    /// 列出手动备份（新→旧）。
+    pub fn list_manual_backups(&self) -> Vec<BackupInfo> {
+        scan_backups(&self.backups_root().join("manual"), Some(&self.config_path))
+    }
+
+    /// 从手动备份恢复 `config.json`（恢复前先把当前配置备份到 `backups/pre-restore/`）。
+    ///
+    /// 备份内容必须是合法配置；否则报错且不改动现有配置。
+    pub fn restore_manual_backup(&mut self, backup_path: &str) -> Result<()> {
+        let bytes = fs::read(backup_path)
+            .with_context(|| format!("读备份失败: {backup_path}"))?;
+        let text = String::from_utf8(bytes.clone())
+            .map_err(|e| anyhow::anyhow!("备份不是 UTF-8 文本: {e}"))?;
+        serde_json::from_str::<Config>(&text)
+            .map_err(|e| anyhow::anyhow!("备份内容不是有效的配置: {e}"))?;
+        // 恢复前保留当前配置，便于回退。
+        let pre = self.backups_root().join("pre-restore");
+        if self.config_path.exists() {
+            fs::create_dir_all(&pre)?;
+            let _ = fs::copy(
+                &self.config_path,
+                pre.join(format!("config-{}.json", now_ts())),
+            );
+        }
+        let tmp = self
+            .config_path
+            .with_extension(format!("restore-{}", now_ts()));
+        fs::write(&tmp, &bytes).with_context(|| format!("写恢复临时文件失败: {}", tmp.display()))?;
+        fs::rename(&tmp, &self.config_path)
+            .with_context(|| format!("替换配置失败: {}", self.config_path.display()))?;
+        self.config = load_config(&self.config_path)?;
+        Ok(())
     }
 
     /// 从备份恢复原文件（复制备份内容到 `.source` 标记的路径）。
@@ -1433,6 +1460,41 @@ fn now_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// 扫描备份目录（新→旧）。`source_override` 为空时读 `.source` 标记文件。
+fn scan_backups(dir: &Path, source_override: Option<&Path>) -> Vec<BackupInfo> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".source") || name.starts_with('.') {
+            continue;
+        }
+        let source = match source_override {
+            Some(p) => p.to_string_lossy().into_owned(),
+            None => fs::read_to_string(format!("{}.source", path.display())).unwrap_or_default(),
+        };
+        let meta = e.metadata().ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let mtime = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        out.push(BackupInfo {
+            path: path.to_string_lossy().into_owned(),
+            source,
+            name,
+            size,
+            mtime,
+        });
+    }
+    out.sort_by_key(|b| std::cmp::Reverse(b.mtime));
+    out
+}
+
 /// 供应商 → 归属工具（由 meta 的 template_type 携带工具 id，kebab-case）。
 pub fn provider_tool_of(p: &Provider) -> Option<Tool> {
     let tool_str = p.meta.as_ref()?.template_type.as_deref()?;
@@ -1744,6 +1806,39 @@ mod tests {
             assert!(list[0].size > 0);
             store.restore_backup(&list[0].path).unwrap();
             assert_eq!(fs::read_to_string(&src).unwrap(), "OLD");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_backup_and_restore_roundtrip() {
+        let dir = test_dir();
+        {
+            let mut store = Store::open_at(dir.clone()).unwrap();
+            store.add_provider(sample_provider("p1")).unwrap();
+            let path = store.manual_backup().unwrap();
+            assert!(path.exists(), "手动备份应落盘");
+            // 备份可在列表中看到，来源指向 config.json。
+            let list = store.list_manual_backups();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].name, path.file_name().unwrap().to_string_lossy());
+            assert!(list[0].source.ends_with("config.json"));
+            assert!(list[0].size > 0);
+            // 改动配置后从备份恢复 → 回到备份时的状态。
+            store.add_provider(sample_provider("p2")).unwrap();
+            assert_eq!(store.config().providers.len(), 2);
+            store
+                .restore_manual_backup(list[0].path.as_str())
+                .unwrap();
+            assert_eq!(store.config().providers.len(), 1);
+            assert!(store.config().providers.contains_key("p1"));
+            // 恢复前快照保留当前配置。
+            assert!(store.backups_root().join("pre-restore").exists());
+            // 非法备份内容被拒绝且不改动配置。
+            let bad = dir.join("bad.json");
+            fs::write(&bad, "not json").unwrap();
+            assert!(store.restore_manual_backup(bad.to_str().unwrap()).is_err());
+            assert_eq!(store.config().providers.len(), 1);
         }
         let _ = fs::remove_dir_all(dir);
     }

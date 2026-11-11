@@ -60,6 +60,8 @@ pub enum LiveWriteError {
     Io { path: PathBuf, source: std::io::Error },
     /// 写后重读与计划不一致（外部并发写）。
     Verify { path: PathBuf },
+    /// 内容/配置不满足写入前提（如缺少端点/密钥），不应猜测改写。
+    Invalid { path: PathBuf, message: String },
 }
 
 impl std::error::Error for LiveWriteError {}
@@ -84,6 +86,9 @@ impl fmt::Display for LiveWriteError {
             }
             Self::Io { path, source } => write!(f, "{} 写入失败: {source}", path.display()),
             Self::Verify { path } => write!(f, "{} 写后重读不一致（外部并发写）", path.display()),
+            Self::Invalid { path, message } => {
+                write!(f, "{} 无法写入: {message}", path.display())
+            }
         }
     }
 }
@@ -93,6 +98,14 @@ pub fn decode_utf8(path: &Path, bytes: &[u8]) -> Result<String, LiveWriteError> 
     String::from_utf8(bytes.to_vec()).map_err(|_| LiveWriteError::Utf8 {
         path: path.to_path_buf(),
     })
+}
+
+/// 读取 JSON/JSONC 文档（宽松解析，允许注释/尾逗号）。用于导入当前客户端配置。
+pub fn read_json_document(path: &Path) -> Result<serde_json::Value, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
+    serde_json_lenient::from_str(&text)
+        .map_err(|err| format!("解析 {} 失败: {err}", path.display()))
 }
 
 /// 一个能对文件内容做补丁的格式适配器。

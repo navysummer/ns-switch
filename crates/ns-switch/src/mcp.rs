@@ -14,6 +14,21 @@ use ns_presets::Tool;
 
 use crate::text_field::TextField;
 
+/// 支持 MCP 统一管理的工具（MCP 页工具页签与同步目标一致）。
+pub const MCP_TOOLS: [Tool; 11] = [
+    Tool::Claude,
+    Tool::Codex,
+    Tool::Gemini,
+    Tool::Opencode,
+    Tool::GrokBuild,
+    Tool::Kimi,
+    Tool::Openclaw,
+    Tool::Hermes,
+    Tool::Pi,
+    Tool::Mcode,
+    Tool::Omp,
+];
+
 /// MCP 面板状态（挂在 SwitchApp 上）。
 pub struct McpPanel {
     /// 当前查看的工具。
@@ -38,6 +53,10 @@ pub struct McpPanel {
     pub scope_path: Entity<TextField>,
     /// 项目作用域 MCP 读取结果。
     pub scope_result: String,
+    /// 同步目标选择浮层（Some = 服务器名）。
+    pub sync_targets_open: Option<String>,
+    /// 同步目标勾选（target tool id_str → 是否选中）。
+    pub sync_target_selected: BTreeMap<String, bool>,
 }
 
 impl McpPanel {
@@ -54,6 +73,8 @@ impl McpPanel {
             scope_open: false,
             scope_path: cx.new(|cx| TextField::new("/path/to/project", cx)),
             scope_result: String::new(),
+            sync_targets_open: None,
+            sync_target_selected: BTreeMap::new(),
         }
     }
 }
@@ -422,6 +443,53 @@ impl McpPanel {
         cx.notify();
     }
 
+    /// 打开同步目标选择浮层（默认选中除当前工具外的全部工具）。
+    pub fn open_sync_targets(&mut self, name: &str, cx: &mut Context<crate::app::SwitchApp>) {
+        self.sync_targets_open = Some(name.to_string());
+        self.sync_target_selected.clear();
+        for t in MCP_TOOLS {
+            if t != self.tool {
+                self.sync_target_selected.insert(t.id_str().to_string(), true);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 切换某个同步目标工具的勾选状态。
+    pub fn toggle_sync_target(&mut self, tool: Tool, cx: &mut Context<crate::app::SwitchApp>) {
+        let entry = self
+            .sync_target_selected
+            .entry(tool.id_str().to_string())
+            .or_insert(false);
+        *entry = !*entry;
+        cx.notify();
+    }
+
+    /// 全选/全不选同步目标。
+    pub fn set_all_sync_targets(&mut self, on: bool, cx: &mut Context<crate::app::SwitchApp>) {
+        for t in MCP_TOOLS {
+            if t != self.tool {
+                self.sync_target_selected.insert(t.id_str().to_string(), on);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 确认同步到所选目标工具（至少选一个）。
+    pub fn confirm_sync_targets(&mut self, cx: &mut Context<crate::app::SwitchApp>) {
+        let Some(name) = self.sync_targets_open.clone() else {
+            return;
+        };
+        let targets = selected_targets(self.tool, &self.sync_target_selected);
+        if targets.is_empty() {
+            self.write_msg = "请至少选择一个目标工具".into();
+            cx.notify();
+            return;
+        }
+        self.sync_targets_open = None;
+        self.sync_to(&name, &targets, cx);
+    }
+
     /// 全部启用/禁用当前工具的全部 MCP 服务器。
     pub fn set_all_enabled(&mut self, enabled: bool, cx: &mut Context<crate::app::SwitchApp>) {
         if self.servers.is_empty() {
@@ -501,9 +569,38 @@ pub fn codex_project_mcp_names(text: &str) -> Vec<String> {
     servers
 }
 
+/// 从同步目标勾选表筛出目标工具（排除当前源工具、未勾选项）。
+pub fn selected_targets(current: Tool, selected: &BTreeMap<String, bool>) -> Vec<Tool> {
+    MCP_TOOLS
+        .iter()
+        .copied()
+        .filter(|t| *t != current && selected.get(t.id_str()).copied().unwrap_or(false))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::codex_project_mcp_names;
+    use super::{codex_project_mcp_names, selected_targets, MCP_TOOLS};
+    use ns_presets::Tool;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn selected_targets_filters_current_and_unchecked() {
+        let mut map = BTreeMap::new();
+        for t in MCP_TOOLS {
+            map.insert(t.id_str().to_string(), true);
+        }
+        // 当前工具被排除；全选时目标是其余全部工具。
+        let targets = selected_targets(Tool::Claude, &map);
+        assert_eq!(targets.len(), MCP_TOOLS.len() - 1);
+        assert!(!targets.contains(&Tool::Claude));
+        // 未勾选的目标不参与同步。
+        map.insert(Tool::Codex.id_str().to_string(), false);
+        let targets = selected_targets(Tool::Claude, &map);
+        assert!(!targets.contains(&Tool::Codex));
+        // 空勾选 → 无目标。
+        assert!(selected_targets(Tool::Claude, &BTreeMap::new()).is_empty());
+    }
 
     #[test]
     fn extracts_codex_project_mcp_names() {

@@ -86,6 +86,19 @@ fn json_tool(endpoint: &str, key: &str, model: &str) -> Value {
     })
 }
 
+/// 按工具生成 `settingsConfig`（导入当前客户端配置时用）。
+///
+/// 与预设 `build` 的字段形状保持一致：Claude/Desktop/Grok 用 `env`，
+/// Codex 用 `{auth,config}`，Gemini 用 `env`，其余共存工具用平铺键。
+pub fn settings_config_for(tool: Tool, endpoint: &str, key: &str, model: &str) -> Value {
+    match tool {
+        Tool::Claude | Tool::ClaudeDesktop | Tool::GrokBuild => claude_env(endpoint, key, model),
+        Tool::Codex => codex_auth(endpoint, key, model),
+        Tool::Gemini => gemini_config(endpoint, key, model),
+        _ => json_tool(endpoint, key, model),
+    }
+}
+
 const fn preset(
     id: &'static str,
     name: &'static str,

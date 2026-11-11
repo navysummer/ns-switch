@@ -1334,16 +1334,23 @@ pub fn export_markdown(meta: &SessionMeta, rounds: &[Round]) -> String {
     }
     out.push_str("\n---\n\n");
     for r in rounds {
-        out.push_str(&format!("## 第 {} 轮\n\n", r.index + 1));
-        out.push_str(&format!("**用户**\n\n{}\n\n", r.user_text));
-        for m in &r.assistant {
-            let tag = if m.is_tool_use {
-                format!("工具 {}", m.tool_name.as_deref().unwrap_or(""))
-            } else {
-                "助手".to_string()
-            };
-            out.push_str(&format!("**{tag}**\n\n{}\n\n", m.text));
-        }
+        out.push_str(&round_markdown(r));
+    }
+    out
+}
+
+/// 单轮 Markdown（复制本轮用）。
+pub fn round_markdown(r: &Round) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("## 第 {} 轮\n\n", r.index + 1));
+    out.push_str(&format!("**用户**\n\n{}\n\n", r.user_text));
+    for m in &r.assistant {
+        let tag = if m.is_tool_use {
+            format!("工具 {}", m.tool_name.as_deref().unwrap_or(""))
+        } else {
+            "助手".to_string()
+        };
+        out.push_str(&format!("**{tag}**\n\n{}\n\n", m.text));
     }
     out
 }
@@ -1536,6 +1543,11 @@ mod tests {
         assert!(md.contains("# 会话 sess-1"));
         assert!(md.contains("第 1 轮"));
         assert!(md.contains("hello"));
+        // 单轮复制：只有该轮，不含会话头。
+        let one = round_markdown(&build_rounds(&msgs)[0]);
+        assert!(one.starts_with("## 第 1 轮"));
+        assert!(one.contains("**用户**\n\nhi"));
+        assert!(!one.contains("# 会话 sess-1"));
         assert_eq!(recover_command("abc"), "osascript -e 'tell application \"Terminal\" to do script \"claude --resume abc\"'");
         assert!(recover_command_for("codex", "abc").contains("codex resume abc"));
     }
