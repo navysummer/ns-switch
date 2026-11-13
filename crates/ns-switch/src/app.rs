@@ -200,15 +200,6 @@ fn merge_details(
     a
 }
 
-/// 在系统终端执行恢复命令（命令由 `ns_sessions::recover_command_for` 生成）。
-fn run_terminal_command(cmd: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    let spawn = std::process::Command::new("cmd").arg("/C").arg(cmd).spawn();
-    #[cfg(not(target_os = "windows"))]
-    let spawn = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
-    spawn.map(|_| ())
-}
-
 /// Page → 侧栏图标字形（纯文本，后续可换 SVG）。
 fn page_glyph(page: Page) -> &'static str {
     match page {
@@ -389,6 +380,8 @@ pub struct SwitchApp {
     /// 请求明细（新→旧）。
 
     pub(crate) usage_details: Vec<ns_usage::RequestDetail>,
+    /// 请求明细分页页码（0 起，每页 20 条）。
+    pub(crate) usage_detail_page: usize,
     /// 按日统计（按工具拆分：key = tool id_str）。用于用量图表按工具筛选。
     pub(crate) usage_daily_by_tool: std::collections::BTreeMap<String, Vec<ns_usage::DailyCount>>,
     /// 用量图表包含的工具（key = tool id_str；空 = 全部）。
@@ -421,6 +414,8 @@ pub struct SwitchApp {
     pub(crate) tools_scanning: bool,
     /// 工具安装/卸载结果消息。
     pub(crate) tool_msg: String,
+    /// 待确认卸载的工具（卸载为不可逆操作，先确认）。
+    pub(crate) tool_uninstall_pending: Option<ns_tools::Tool>,
     /// 项目快照新项目名输入。
     pub(crate) project_name: gpui::Entity<crate::text_field::TextField>,
     /// 自动更新检查结果（None = 未检查）。
@@ -461,6 +456,20 @@ pub struct SwitchApp {
     pub(crate) backup_status: String,
     /// 待确认的备份恢复（来源、路径、显示名）。
     pub(crate) backup_restore_pending: Option<(BackupRestoreKind, String, String)>,
+    /// 配置导入/导出文件路径输入。
+    pub(crate) config_io_path: gpui::Entity<crate::text_field::TextField>,
+    /// 配置导入/导出操作状态。
+    pub(crate) config_io_status: String,
+    /// 待确认的配置导入文件路径（导入会覆盖当前配置）。
+    pub(crate) config_import_pending: Option<String>,
+    /// shell 配置中与供应商相关的环境变量冲突。
+    pub(crate) env_conflicts: Vec<(ns_presets::Tool, crate::envcheck::EnvConflict)>,
+    /// 环境变量冲突操作状态。
+    pub(crate) env_conflict_status: String,
+    /// 待确认删除的环境变量冲突（工具、冲突、文件路径）。
+    pub(crate) env_remove_pending: Option<(ns_presets::Tool, crate::envcheck::EnvConflict)>,
+    /// 供应商页环境变量冲突横幅是否已被忽略。
+    pub(crate) env_banner_dismissed: bool,
     /// 设置页当前分区。
     pub(crate) settings_section: SettingsSection,
     /// 通用供应商对话框打开。
@@ -591,6 +600,7 @@ impl SwitchApp {
             session_scanning: false,
             usage_daily: Vec::new(),
             usage_details: Vec::new(),
+            usage_detail_page: 0,
             usage_daily_by_tool: Default::default(),
             usage_chart_tools: Default::default(),
             usage_range_days: 30,
@@ -607,6 +617,7 @@ impl SwitchApp {
             tools_result: Vec::new(),
             tools_scanning: false,
             tool_msg: String::new(),
+            tool_uninstall_pending: None,
             project_name: cx.new(|cx| crate::text_field::TextField::new("项目名…", cx)),
             update_status: None,
             sync_url: cx.new(|cx| crate::text_field::TextField::new("WebDAV URL…", cx)),
@@ -630,6 +641,13 @@ impl SwitchApp {
             config_dir_status: String::new(),
             backup_status: String::new(),
             backup_restore_pending: None,
+            config_io_path: cx.new(|cx| crate::text_field::TextField::new("配置文件路径（如 ~/Desktop/ns-switch-config.json）", cx)),
+            config_io_status: String::new(),
+            config_import_pending: None,
+            env_conflicts: Vec::new(),
+            env_conflict_status: String::new(),
+            env_remove_pending: None,
+            env_banner_dismissed: false,
             settings_section: SettingsSection::General,
             universal_open: false,
             universal_edit: None,
@@ -835,6 +853,7 @@ impl SwitchApp {
             }).ok();
         })
         .detach();
+        app.scan_env_conflicts();
         app
     }
 
@@ -1553,7 +1572,11 @@ impl SwitchApp {
                     ),
             )
             .child(self.render_provider_mode_tabs(cx))
-            .when(!self.switch_conflicts.is_empty() || !self.startup_conflicts.is_empty(), |el| {
+            .when(
+                !self.switch_conflicts.is_empty()
+                    || !self.startup_conflicts.is_empty()
+                    || (!self.env_conflicts.is_empty() && !self.env_banner_dismissed),
+                |el| {
                 let mut text = String::new();
                 if !self.startup_conflicts.is_empty() {
                     text.push_str(&format!("启动扫描（{}）：{}", self.startup_conflicts.len(), self.startup_conflicts.join("；")));
@@ -1563,6 +1586,15 @@ impl SwitchApp {
                         text.push_str(" | ");
                     }
                     text.push_str(&format!("切换检测（{}）：{}", self.switch_conflicts.len(), self.switch_conflicts.join("；")));
+                }
+                if !self.env_conflicts.is_empty() && !self.env_banner_dismissed {
+                    if !text.is_empty() {
+                        text.push_str(" | ");
+                    }
+                    text.push_str(&format!(
+                        "环境变量（{}）：shell 导出的供应商变量会覆盖配置，切换可能不生效（设置 → 数据 处理）",
+                        self.env_conflicts.len()
+                    ));
                 }
                 el.child(
                     div()
@@ -1589,6 +1621,7 @@ impl SwitchApp {
                                 cx.listener(|this, _, _, cx| {
                                     this.switch_conflicts.clear();
                                     this.startup_conflicts.clear();
+                                    this.env_banner_dismissed = true;
                                     cx.notify();
                                 }),
                             ),
@@ -2464,6 +2497,7 @@ impl SwitchApp {
                 this.session_stats = stats;
                 this.usage_daily = daily;
                 this.usage_details = details;
+                this.usage_detail_page = 0;
                 this.usage_daily_by_tool = by_tool;
                 // 首次扫描时默认全选。
                 if this.usage_chart_tools.is_empty() {
@@ -3058,51 +3092,96 @@ impl SwitchApp {
                 div()
                     .flex_col()
                     .gap(px(6.))
-                    .child(
+                    .child({
+                        let page_size = 20usize;
+                        let total = details.len();
+                        let pages = total.div_ceil(page_size).max(1);
+                        let page = self.usage_detail_page.min(pages - 1);
                         div()
-                            .text_size(px(13.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child("请求明细"),
-                    )
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(13.))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme::text())
+                                    .child(format!("请求明细（{total}）")),
+                            )
+                            .when(total > page_size, |el| {
+                                el.child(
+                                    widgets::ghost_button("usage-detail-prev", "上一页")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.usage_detail_page =
+                                                this.usage_detail_page.saturating_sub(1);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::text_faint())
+                                        .child(format!("{}/{}", page + 1, pages)),
+                                )
+                                .child(
+                                    widgets::ghost_button("usage-detail-next", "下一页")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.usage_detail_page =
+                                                (this.usage_detail_page + 1).min(pages - 1);
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                    })
                     .child(if details.is_empty() {
                         div()
                             .text_size(px(12.))
                             .text_color(theme::text_faint())
                             .child("扫描后显示明细")
                     } else {
+                        let page_size = 20usize;
+                        let pages = details.len().div_ceil(page_size).max(1);
+                        let page = self.usage_detail_page.min(pages - 1);
                         div()
                             .flex_col()
-                            .children(details.iter().take(20).enumerate().map(|(i, d)| {
-                                div()
-                                    .id(("usage-detail-row", i))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(10.))
-                                    .text_size(px(12.))
-                                    .text_color(theme::text_dim())
-                                    .child(
+                            .children(
+                                details
+                                    .iter()
+                                    .skip(page * page_size)
+                                    .take(page_size)
+                                    .enumerate()
+                                    .map(|(i, d)| {
                                         div()
-                                            .w(px(56.))
-                                            .text_color(theme::text_faint())
-                                            .child(match d.tool.as_str() {
-                                                "claude" => "Claude",
-                                                "codex" => "Codex",
-                                                "gemini" => "Gemini",
-                                                _ => "-",
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_family(theme::MONO_FONT)
-                                            .text_color(theme::accent())
-                                            .child(d.model.clone()),
-                                    )
-                                    .child(format!(
-                                        "输入 {} · 输出 {}",
-                                        d.input_tokens, d.output_tokens
-                                    ))
-                            }))
+                                            .id(("usage-detail-row", page * page_size + i))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .text_size(px(12.))
+                                            .text_color(theme::text_dim())
+                                            .child(
+                                                div()
+                                                    .w(px(56.))
+                                                    .text_color(theme::text_faint())
+                                                    .child(match d.tool.as_str() {
+                                                        "claude" => "Claude",
+                                                        "codex" => "Codex",
+                                                        "gemini" => "Gemini",
+                                                        _ => "-",
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(theme::MONO_FONT)
+                                                    .text_color(theme::accent())
+                                                    .child(d.model.clone()),
+                                            )
+                                            .child(format!(
+                                                "输入 {} · 输出 {}",
+                                                d.input_tokens, d.output_tokens
+                                            ))
+                                    }),
+                            )
                     }),
             )
     }
@@ -3317,8 +3396,11 @@ impl SwitchApp {
                                                     .map(|m| m.tool.as_str())
                                                     .unwrap_or("claude");
                                                 let cmd = ns_sessions::recover_command_for(tool, &sid_recover);
-                                                this.status = cmd.clone();
-                                                this.status_tone = StatusTone::Neutral;
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    cmd.clone(),
+                                                ));
+                                                this.status = format!("已复制恢复命令：{cmd}");
+                                                this.status_tone = StatusTone::Success;
                                                 cx.notify();
                                             }),
                                         ),
@@ -3332,7 +3414,11 @@ impl SwitchApp {
                                                     .map(|m| m.tool.as_str())
                                                     .unwrap_or("claude");
                                                 let cmd = ns_sessions::recover_command_for(tool, &sid_terminal);
-                                                match run_terminal_command(&cmd) {
+                                                let pref = this.terminal_pref();
+                                                let home = std::env::var_os("HOME")
+                                                    .map(std::path::PathBuf::from)
+                                                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                                                match crate::terminal::run_command(&home, &cmd, &pref) {
                                                     Ok(()) => {
                                                         this.status = format!("已在终端恢复会话：{cmd}");
                                                         this.status_tone = StatusTone::Success;
@@ -3761,12 +3847,22 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
     fn escape_dialog(&mut self, cx: &mut Context<Self>) {
         if self.backup_restore_pending.is_some() {
             self.backup_restore_pending = None;
+        } else if self.config_import_pending.is_some() {
+            self.config_import_pending = None;
+        } else if self.env_remove_pending.is_some() {
+            self.env_remove_pending = None;
+        } else if self.tool_uninstall_pending.is_some() {
+            self.tool_uninstall_pending = None;
         } else if self.pending_switch.is_some() {
             self.pending_switch = None;
             self.status = "已取消切换".into();
             self.status_tone = StatusTone::Neutral;
         } else if self.deeplink_pending.is_some() {
+            self.deeplink_pending = None;
+            self.status = "已取消深链导入".into();
+            self.status_tone = StatusTone::Neutral;
         } else if self.confirm_delete.is_some() {
+            self.confirm_delete = None;
         } else if self.edit_id.is_some() || self.add_open {
             if self.dialog_is_dirty(cx) {
                 // 有未保存修改：显示守卫确认浮层，不直接关闭。
@@ -3810,7 +3906,8 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                         .find(|p| p.id == id)
                 });
             if let Some(preset) = preset {
-                crate::dialog::save_provider(self, preset, &self.dialog_fields.clone(), cx);
+                let fields = self.dialog_fields.with_inputs(&self.dialog_inputs, cx);
+                crate::dialog::save_provider(self, preset, &fields, cx);
             } else {
                 self.status = "请先选择预设".into();
                 self.status_tone = StatusTone::Error;
@@ -4395,7 +4492,8 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                                             .on_click({
                                                 let t = *tool;
                                                 cx.listener(move |this, _, _, cx| {
-                                                    this.uninstall_cli(t, cx);
+                                                    this.tool_uninstall_pending = Some(t);
+                                                    cx.notify();
                                                 })
                                             }),
                                         )
@@ -6420,6 +6518,76 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                 )
             })
             .when(self.settings_section == SettingsSection::General, |el| {
+                let current = crate::terminal::resolve(
+                    &self
+                        .store
+                        .read()
+                        .map(|s| s.config().settings.terminal().to_string())
+                        .unwrap_or_default(),
+                )
+                .to_string();
+                el.child(
+                    div()
+                        .flex_col()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme::text_dim())
+                                        .child("首选终端"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(theme::text_faint())
+                                        .child("「打开配置目录」「在终端恢复会话」使用该终端"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(6.))
+                                .children(
+                                    crate::terminal::options()
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, (value, label))| {
+                                            let value = *value;
+                                            let selected = value == current;
+                                            widgets::pill(
+                                                *label,
+                                                if selected {
+                                                    theme::accent()
+                                                } else {
+                                                    theme::text_faint()
+                                                },
+                                            )
+                                            .id(("terminal-option", i))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let r = this
+                                                    .store
+                                                    .write()
+                                                    .expect("store lock")
+                                                    .set_terminal(value);
+                                                this.status = match r {
+                                                    Ok(()) => {
+                                                        format!("首选终端：{value}")
+                                                    }
+                                                    Err(e) => format!("写入失败: {e}"),
+                                                };
+                                                cx.notify();
+                                            }))
+                                        }),
+                                ),
+                        ),
+                )
+            })
+            .when(self.settings_section == SettingsSection::General, |el| {
                 el.child(
                 div()
                     .flex_col()
@@ -6776,6 +6944,176 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                                 .child(self.backup_status.clone()),
                         )
                     })
+                )
+            })
+            .when(self.settings_section == SettingsSection::Data, |el| {
+                el.child(
+                    div()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .bg(theme::panel_a(0.3))
+                        .border_1()
+                        .border_color(theme::stroke_a(0.08))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("导入 / 导出配置"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::text_faint())
+                                .child("导出完整 config.json（供应商/设置/路由/项目/账号）；导入前自动备份当前配置到 backups/pre-import/"),
+                        )
+                        .child(div().w_full().child(self.config_io_path.clone()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(px(8.))
+                                .child(
+                                    widgets::ghost_button("config-pick-import", "选择配置文件")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_config_file(false, cx)
+                                        })),
+                                )
+                                .child(
+                                    widgets::ghost_button("config-pick-export", "选择导出位置")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_config_file(true, cx)
+                                        })),
+                                )
+                                .child(
+                                    widgets::ghost_button("config-import", "导入配置").on_click(
+                                        cx.listener(|this, _, _, cx| this.request_import_config(cx)),
+                                    ),
+                                )
+                                .child(
+                                    widgets::primary_button("config-export", "导出配置").on_click(
+                                        cx.listener(|this, _, _, cx| this.export_config_file(cx)),
+                                    ),
+                                ),
+                        )
+                        .when(!self.config_io_status.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::accent())
+                                    .child(self.config_io_status.clone()),
+                            )
+                        }),
+                )
+            })
+            .when(self.settings_section == SettingsSection::Data, |el| {
+                let conflicts = self.env_conflicts.clone();
+                el.child(
+                    div()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(10.))
+                        .rounded(px(8.))
+                        .bg(theme::panel_a(0.3))
+                        .border_1()
+                        .border_color(theme::stroke_a(0.08))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(px(13.))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child(format!("环境变量冲突（{}）", conflicts.len())),
+                                )
+                                .child(
+                                    widgets::ghost_button("env-rescan", "重新扫描").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.scan_env_conflicts();
+                                            this.env_conflict_status = format!(
+                                                "已扫描：{} 条冲突",
+                                                this.env_conflicts.len()
+                                            );
+                                            cx.notify();
+                                        }),
+                                    ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::text_faint())
+                                .child("shell 配置里 export 的 ANTHROPIC_/OPENAI_/GEMINI_/XAI_ 变量会覆盖工具配置，导致切换不生效"),
+                        )
+                        .child(if conflicts.is_empty() {
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::text_faint())
+                                .child("未发现环境变量冲突（已扫描 ~/.zshrc、~/.zprofile、~/.bashrc、~/.profile 等）")
+                        } else {
+                            div()
+                                .flex_col()
+                                .gap(px(4.))
+                                .children(conflicts.into_iter().take(20).enumerate().map(
+                                    |(i, (tool, c))| {
+                                        let open_path = c.source_path.clone();
+                                        let pending = (tool, c.clone());
+                                        div()
+                                            .id(("env-conflict-row", i))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme::text_dim())
+                                                    .child(format!(
+                                                        "{} · {}={} · {}:{}",
+                                                        tool.label(),
+                                                        c.var_name,
+                                                        c.var_value,
+                                                        c.source_path,
+                                                        c.line_no
+                                                    )),
+                                            )
+                                            .child(
+                                                widgets::ghost_button(
+                                                    ("env-open", i),
+                                                    "打开文件",
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.open_env_conflict_file(&open_path, cx)
+                                                })),
+                                            )
+                                            .child(
+                                                widgets::ghost_button(
+                                                    ("env-remove", i),
+                                                    "删除",
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.env_remove_pending =
+                                                        Some(pending.clone());
+                                                    cx.notify();
+                                                })),
+                                            )
+                                    },
+                                ))
+                        })
+                        .when(!self.env_conflict_status.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::accent())
+                                    .child(self.env_conflict_status.clone()),
+                            )
+                        }),
                 )
             })
             .when(self.settings_section == SettingsSection::Data, |el| {
@@ -12086,34 +12424,20 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
         } else {
             std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or(dir)
         };
-        #[cfg(target_os = "macos")]
-        let r = std::process::Command::new("open")
-            .args(["-a", "Terminal"])
-            .arg(&target)
-            .spawn();
-        #[cfg(target_os = "linux")]
-        let r = std::process::Command::new("x-terminal-emulator")
-            .arg(format!("--working-directory={}", target.display()))
-            .spawn()
-            .or_else(|_| std::process::Command::new("xdg-open").arg(&target).spawn());
-        #[cfg(target_os = "windows")]
-        let r = std::process::Command::new("cmd")
-            .args([
-                "/C",
-                "start",
-                "cmd",
-                "/K",
-                &format!("cd /d {}", target.display()),
-            ])
-            .spawn();
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-        let r: std::io::Result<std::process::Child> =
-            Err(std::io::Error::other("unsupported platform"));
-        match r {
-            Ok(_) => self.status = format!("已在终端打开：{}", target.display()),
-            Err(e) => self.status = format!("打开终端失败：{e}"),
+        let pref = self.terminal_pref();
+        match crate::terminal::open_at(&target, &pref) {
+            Ok(()) => self.status = format!("已在终端打开：{}", target.display()),
+            Err(e) => self.status = format!("打开终端失败：{e}; 目录：{}", target.display()),
         }
         cx.notify();
+    }
+
+    /// 读取首选终端（空 = 平台默认）。
+    fn terminal_pref(&self) -> String {
+        self.store
+            .read()
+            .map(|s| s.config().settings.terminal().to_string())
+            .unwrap_or_default()
     }
 
     /// 立即备份 `config.json` 到 `~/.ns-switch/backups/manual/`。
@@ -12259,6 +12583,429 @@ fn deeplink_summary(action: &crate::deeplink::DeepLinkAction) -> String {
                                 widgets::primary_button("backup-restore-go", "确认恢复").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.confirm_backup_restore(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    /// 选择配置文件（导入）或导出位置（macOS 原生选择器；其他平台手输）。
+    fn choose_config_file(&mut self, for_export: bool, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            let script = if for_export {
+                "POSIX path of (choose file name with prompt \"导出配置\" default name \"ns-switch-config.json\")"
+            } else {
+                "POSIX path of (choose file with prompt \"选择 ns-switch 配置文件\")"
+            };
+            match std::process::Command::new("osascript")
+                .args(["-e", script])
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if p.is_empty() {
+                        self.config_io_status = "未选择文件".into();
+                    } else {
+                        self.config_io_path.update(cx, |tf, _| tf.set_text(&p));
+                        self.config_io_status = format!("已选择：{p}");
+                    }
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    self.config_io_status = if err.contains("-128")
+                        || err.to_lowercase().contains("cancel")
+                    {
+                        "已取消选择".into()
+                    } else {
+                        format!("选择文件失败: {err}")
+                    };
+                }
+                Err(e) => self.config_io_status = format!("无法打开选择器: {e}"),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.config_io_status = if for_export {
+                "请在输入框输入导出路径".into()
+            } else {
+                "请在输入框输入要导入的配置文件路径".into()
+            };
+        }
+        cx.notify();
+    }
+
+    /// 导出完整配置到输入框路径。
+    fn export_config_file(&mut self, cx: &mut Context<Self>) {
+        let path = self.config_io_path.read(cx).text().trim().to_string();
+        if path.is_empty() {
+            self.config_io_status = "请先填写或选择导出路径".into();
+            self.status = self.config_io_status.clone();
+            self.status_tone = StatusTone::Error;
+            cx.notify();
+            return;
+        }
+        let r = self.store.read().expect("store lock").export_config_to(&path);
+        match r {
+            Ok(p) => {
+                self.config_io_status = format!("已导出配置 → {}", p.display());
+                self.status = self.config_io_status.clone();
+                self.status_tone = StatusTone::Success;
+            }
+            Err(e) => {
+                self.config_io_status = format!("导出失败：{e}");
+                self.status = self.config_io_status.clone();
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 请求导入配置（先确认：导入会覆盖当前配置）。
+    fn request_import_config(&mut self, cx: &mut Context<Self>) {
+        let path = self.config_io_path.read(cx).text().trim().to_string();
+        if path.is_empty() {
+            self.config_io_status = "请先填写或选择要导入的配置文件".into();
+            self.status = self.config_io_status.clone();
+            self.status_tone = StatusTone::Error;
+            cx.notify();
+            return;
+        }
+        self.config_import_pending = Some(path);
+        cx.notify();
+    }
+
+    /// 执行导入（校验 + 导入前备份 + 覆盖 config.json）。
+    fn confirm_import_config(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.config_import_pending.take() else {
+            return;
+        };
+        let r = self
+            .store
+            .write()
+            .expect("store lock")
+            .import_config_from(&path);
+        match r {
+            Ok(()) => {
+                self.config_io_status =
+                    format!("已导入配置：{path}（原配置已存 backups/pre-import/）");
+                self.status = self.config_io_status.clone();
+                self.status_tone = StatusTone::Success;
+                // 重新应用导入配置里的全局代理。
+                let proxy = self
+                    .store
+                    .read()
+                    .ok()
+                    .and_then(|s| s.config().settings.global_proxy().map(str::to_string));
+                let text = proxy.clone().unwrap_or_default();
+                self.global_proxy_url.update(cx, |tf, _| tf.set_text(&text));
+                unsafe {
+                    for (k, _) in crate::proxy_env::curl_env("") {
+                        std::env::remove_var(k);
+                    }
+                    if let Some(p) = proxy.as_deref() {
+                        for (k, v) in crate::proxy_env::curl_env(p) {
+                            std::env::set_var(k, v);
+                        }
+                    }
+                }
+                self.refresh_tray_menu(cx);
+            }
+            Err(e) => {
+                self.config_io_status = format!("导入失败：{e}");
+                self.status = self.config_io_status.clone();
+                self.status_tone = StatusTone::Error;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 配置导入确认浮层（覆盖前确认）。
+    fn render_config_import_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let path = self
+            .config_import_pending
+            .clone()
+            .expect("config_import_pending 非空");
+        div()
+            .id("config-import-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("config-import-confirm")
+                    .w(px(480.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("导入配置"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "将用该文件覆盖 ~/.ns-switch/config.json（供应商、设置、路由、项目、账号）。\n当前配置会先备份到 backups/pre-import/。\n文件：{path}"
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::cinnabar())
+                            .child("⚠ 导入后 live 客户端配置不会自动改写；需要时请在供应商页重新切换一次。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("config-import-cancel", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.config_import_pending = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button("config-import-go", "确认导入").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirm_import_config(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    /// 扫描 shell 配置中的供应商环境变量冲突（Claude/Codex/Gemini/Grok）。
+    fn scan_env_conflicts(&mut self) {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            self.env_conflicts.clear();
+            return;
+        };
+        let mut out = Vec::new();
+        for tool in [
+            ns_presets::Tool::Claude,
+            ns_presets::Tool::Codex,
+            ns_presets::Tool::Gemini,
+            ns_presets::Tool::GrokBuild,
+        ] {
+            for c in crate::envcheck::conflicts_for_tool(&home, tool) {
+                out.push((tool, c));
+            }
+        }
+        self.env_conflicts = out;
+    }
+
+    /// 用系统默认程序打开冲突所在的 shell 配置文件。
+    fn open_env_conflict_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        let opened = {
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("open").arg("-t").arg(path).spawn()
+            }
+            #[cfg(target_os = "linux")]
+            {
+                std::process::Command::new("xdg-open").arg(path).spawn()
+            }
+            #[cfg(target_os = "windows")]
+            {
+                std::process::Command::new("notepad").arg(path).spawn()
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            {
+                Err::<std::process::Child, _>(std::io::Error::other("unsupported platform"))
+            }
+        };
+        self.env_conflict_status = match opened {
+            Ok(_) => format!("已打开：{path}"),
+            Err(e) => format!("打开失败：{e}"),
+        };
+        cx.notify();
+    }
+
+    /// 执行待确认的环境变量删除（删行 + 重新扫描）。
+    fn confirm_remove_env_conflict(&mut self, cx: &mut Context<Self>) {
+        let Some((tool, c)) = self.env_remove_pending.take() else {
+            return;
+        };
+        let r = crate::envcheck::remove_line(
+            std::path::Path::new(&c.source_path),
+            &c.var_name,
+            c.line_no,
+        );
+        self.env_conflict_status = match r {
+            Ok(()) => format!(
+                "已删除 {}（{}）：{}:{}（已留 .bak 备份）",
+                c.var_name,
+                tool.label(),
+                c.source_path,
+                c.line_no
+            ),
+            Err(e) => format!("删除失败：{e}"),
+        };
+        self.scan_env_conflicts();
+        cx.notify();
+    }
+
+    /// 环境变量冲突删除确认浮层。
+    fn render_env_conflict_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tool, c) = self
+            .env_remove_pending
+            .clone()
+            .expect("env_remove_pending 非空");
+        div()
+            .id("env-conflict-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("env-conflict-confirm")
+                    .w(px(500.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child("删除环境变量定义"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "将从 shell 配置中删除该行（其他行不动）：\n{}:{}  export {}={}\n工具：{}\n\n删除前会保留 .bak 备份。",
+                                c.source_path,
+                                c.line_no,
+                                c.var_name,
+                                c.var_value,
+                                tool.label()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::cinnabar())
+                            .child("⚠ 已打开的终端需要重新加载配置（或新开窗口）才会生效。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("env-conflict-cancel", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.env_remove_pending = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::primary_button("env-conflict-go", "删除该行").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirm_remove_env_conflict(cx);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
+    }
+
+    /// 工具卸载确认浮层（卸载不可逆，先确认）。
+    fn render_tool_uninstall_confirm(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tool = self
+            .tool_uninstall_pending
+            .expect("tool_uninstall_pending 非空");
+        div()
+            .id("tool-uninstall-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::color(0x000000).opacity(0.6))
+            .child(
+                div()
+                    .id("tool-uninstall-confirm")
+                    .w(px(470.))
+                    .flex_col()
+                    .gap(px(14.))
+                    .p(px(22.))
+                    .rounded(px(16.))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::stroke_a(0.3))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(format!("卸载 {}", tool.name())),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme::text())
+                            .child(format!(
+                                "将执行：{}\n\n卸载后该工具无法启动；供应商配置会保留在 ~/.ns-switch/config.json，重新安装后可继续使用。",
+                                tool.uninstall_command()
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::cinnabar())
+                            .child("⚠ 此操作不可撤销。若只是暂时不用，建议保留安装。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                widgets::ghost_button("tool-uninstall-cancel", "取消").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.tool_uninstall_pending = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                widgets::danger_button("tool-uninstall-go", "确认卸载").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        let Some(tool) = this.tool_uninstall_pending.take() else {
+                                            return;
+                                        };
+                                        this.uninstall_cli(tool, cx);
                                     }),
                                 ),
                             ),
@@ -12839,7 +13586,7 @@ pub fn now_ts_suffix() -> String {
 }
 
 /// 解析 `#RRGGBB`/`RRGGBB` 为 0xRRGGBB。
-fn parse_hex_color(s: &str) -> Option<u32> {
+pub(crate) fn parse_hex_color(s: &str) -> Option<u32> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 {
         return None;
@@ -13013,6 +13760,21 @@ impl Render for SwitchApp {
             })
             .child(if self.backup_restore_pending.is_some() {
                 self.render_backup_restore_confirm(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.config_import_pending.is_some() {
+                self.render_config_import_confirm(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.env_remove_pending.is_some() {
+                self.render_env_conflict_confirm(cx).into_any_element()
+            } else {
+                div().into_any_element()
+            })
+            .child(if self.tool_uninstall_pending.is_some() {
+                self.render_tool_uninstall_confirm(cx).into_any_element()
             } else {
                 div().into_any_element()
             })
@@ -13232,28 +13994,9 @@ fn provider_is_official(p: &ns_presets::Provider) -> bool {
 
 /// 品牌图标 id → 显示字形（图标字符映射；未知 id 回退首字母）。
 fn icon_glyph(icon_id: &str, fallback: char) -> String {
-    let g = match icon_id {
-        "anthropic" => '❋',
-        "openai" => '⬡',
-        "google" => '◆',
-        "grok" => '✦',
-        "copilot" => '⌥',
-        "api" => '⌁',
-        "router" => '⛶',
-        "cloud" => '☁',
-        "code" => '⌘',
-        "sub" => '⧉',
-        "flow" => '≋',
-        "local" => '⬢',
-        "mini" => '▣',
-        "kimi" => '✳',
-        "pi" => 'π',
-        "hermes" => '⚡',
-        "claw" => '✪',
-        "omp" => '◉',
-        _ => fallback,
-    };
-    g.to_string()
+    ns_presets::icon_char(icon_id)
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 #[cfg(test)]

@@ -1360,7 +1360,7 @@ pub fn recover_command(session_id: &str) -> String {
     recover_command_for("claude", session_id)
 }
 
-/// 按工具生成恢复命令。
+/// 按工具生成恢复命令（纯命令，不含终端启动包装；由界面用首选终端执行）。
 pub fn recover_command_for(tool: &str, session_id: &str) -> String {
     let (bin, arg) = match tool {
         "codex" => ("codex", "resume"),
@@ -1371,22 +1371,7 @@ pub fn recover_command_for(tool: &str, session_id: &str) -> String {
         "openclaw" => ("openclaw", "resume"),
         _ => ("claude", "--resume"),
     };
-    let cmd = format!("{bin} {arg} {session_id}");
-    if cfg!(target_os = "macos") {
-        format!("osascript -e 'tell application \"Terminal\" to do script \"{cmd}\"'")
-    } else if cfg!(target_os = "linux") {
-        format!(
-            "gnome-terminal -- bash -c '{cmd}; exec bash' 2>/dev/null &\n\
-             xterm -e '{cmd}; exec bash' 2>/dev/null &\n\
-             konsole -e bash -c '{cmd}; exec bash' 2>/dev/null &"
-        )
-    } else if cfg!(target_os = "windows") {
-        format!(
-            "powershell -Command \"Start-Process powershell -ArgumentList '-NoExit', '-Command', '{cmd}'\""
-        )
-    } else {
-        cmd
-    }
+    format!("{bin} {arg} {session_id}")
 }
 
 #[cfg(test)]
@@ -1548,8 +1533,9 @@ mod tests {
         assert!(one.starts_with("## 第 1 轮"));
         assert!(one.contains("**用户**\n\nhi"));
         assert!(!one.contains("# 会话 sess-1"));
-        assert_eq!(recover_command("abc"), "osascript -e 'tell application \"Terminal\" to do script \"claude --resume abc\"'");
-        assert!(recover_command_for("codex", "abc").contains("codex resume abc"));
+        // 恢复命令为纯命令，终端包装由界面按首选终端执行。
+        assert_eq!(recover_command("abc"), "claude --resume abc");
+        assert_eq!(recover_command_for("codex", "abc"), "codex resume abc");
     }
 
     #[test]

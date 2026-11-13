@@ -209,8 +209,8 @@ pub fn add_dialog(
         .bg(theme::alpha(0x000000, 0.55))
         .child(
             div()
-                .w(px(560.))
-                .max_h(px(620.))
+                .w(px(620.))
+                .max_h(px(680.))
                 .rounded(px(14.))
                 .bg(theme::panel())
                 .border_1()
@@ -305,6 +305,8 @@ fn preset_grid(
     div()
         .id("preset-grid")
         .flex_1()
+        .max_h(px(500.))
+        .min_h(px(0.))
         .overflow_y_scroll()
         .p(px(16.))
         .flex_col()
@@ -327,9 +329,20 @@ fn preset_row(preset: &'static Preset, cx: &mut Context<crate::app::SwitchApp>) 
         .on_click(cx.listener(move |this, _, _, cx| {
             this.dialog_preset = Some(pid.clone());
             this.dialog_fields = DialogFields::from_preset(preset);
-            // 选择预设后回填名称；连接字段保持用户当前输入（同预设可只改 key）。
-            let name = this.dialog_fields.name.clone();
-            this.dialog_inputs.name.update(cx, |f, _| f.set_text(&name));
+            // 选择预设后回填预设自带字段；接口地址/密钥保持用户当前输入（同预设可只改 key）。
+            let fields = this.dialog_fields.clone();
+            this.dialog_inputs
+                .name
+                .update(cx, |f, _| f.set_text(&fields.name));
+            this.dialog_inputs
+                .model
+                .update(cx, |f, _| f.set_text(&fields.model));
+            this.dialog_inputs
+                .icon
+                .update(cx, |f, _| f.set_text(&fields.icon));
+            this.dialog_inputs
+                .icon_color
+                .update(cx, |f, _| f.set_text(&fields.icon_color));
             cx.notify();
         }))
         .child(
@@ -360,6 +373,137 @@ fn preset_row(preset: &'static Preset, cx: &mut Context<crate::app::SwitchApp>) 
 }
 
 
+/// 图标选择器：品牌字形网格（点选写入图标 id）。
+fn icon_picker(
+    icon: &gpui::Entity<crate::text_field::TextField>,
+    cx: &mut Context<crate::app::SwitchApp>,
+) -> Div {
+    let current = icon.read(cx).text();
+    div()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme::text_faint())
+                .child("选择图标"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(5.))
+                .children(ns_presets::ICONS.iter().enumerate().map(
+                    |(i, (id, label, glyph))| {
+                        let id = *id;
+                        let selected = current == id;
+                        div()
+                            .id(("dlg-icon", i))
+                            .size(px(28.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .bg(if selected {
+                                theme::accent().opacity(0.28)
+                            } else {
+                                theme::panel_a(0.4)
+                            })
+                            .border_1()
+                            .border_color(if selected {
+                                theme::accent()
+                            } else {
+                                theme::stroke_a(0.15)
+                            })
+                            .text_color(if selected {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .text_size(px(13.))
+                            .child(glyph.to_string())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.dialog_inputs
+                                    .icon
+                                    .update(cx, |f, _| f.set_text(id));
+                                this.status = format!("图标：{label}");
+                                this.status_tone = StatusTone::Neutral;
+                                cx.notify();
+                            }))
+                    },
+                )),
+        )
+}
+
+/// 颜色选择器：预设色板（点选写入十六进制颜色）。
+fn color_picker(
+    color: &gpui::Entity<crate::text_field::TextField>,
+    cx: &mut Context<crate::app::SwitchApp>,
+) -> Div {
+    let current = color.read(cx).text().to_lowercase();
+    div()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme::text_faint())
+                .child("选择颜色"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(5.))
+                .children(ns_presets::ICON_COLORS.iter().enumerate().map(
+                    |(i, (hex, name))| {
+                        let hex = *hex;
+                        let name = *name;
+                        let rgb = crate::app::parse_hex_color(hex).unwrap_or(0xc9a25f);
+                        let selected = current == hex.to_lowercase();
+                        div()
+                            .id(("dlg-color", i))
+                            .size(px(22.))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .bg(theme::color(rgb))
+                            .border_1()
+                            .border_color(if selected {
+                                theme::text()
+                            } else {
+                                theme::stroke_a(0.2)
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.dialog_inputs
+                                    .icon_color
+                                    .update(cx, |f, _| f.set_text(hex));
+                                this.status = format!("图标颜色：{name}");
+                                this.status_tone = StatusTone::Neutral;
+                                cx.notify();
+                            }))
+                    },
+                )),
+        )
+}
+
+impl DialogFields {
+    /// 用当前输入实体覆盖文本字段（Cmd-S 等非渲染入口使用）。
+    ///
+    /// `api_format`/`usage_enabled` 等开关字段仍取自 `self`（由界面直接写）。
+    pub fn with_inputs(&self, inputs: &DialogInputs, cx: &gpui::App) -> Self {
+        let mut f = self.clone();
+        f.name = inputs.name.read(cx).text();
+        f.endpoint = inputs.endpoint.read(cx).text();
+        f.key = inputs.key.read(cx).text();
+        f.model = inputs.model.read(cx).text();
+        f.usage_script = inputs.usage_script.read(cx).text();
+        f.icon = inputs.icon.read(cx).text();
+        f.icon_color = inputs.icon_color.read(cx).text();
+        f
+    }
+}
+
 fn form_and_preview(
     preset: &'static Preset,
     fields: &DialogFields,
@@ -386,15 +530,24 @@ fn form_and_preview(
 
     div()
         .flex_1()
-        .flex()
-        .gap(px(0.))
+        .flex_col()
+        .min_h(px(0.))
         .child(
             div()
-                .w(px(300.))
-                .p(px(16.))
-                .flex_col()
-                .gap(px(10.))
-                .child(field_input("供应商名称", &inputs.name, cx))
+                .flex_1()
+                .flex()
+                .min_h(px(0.))
+                .gap(px(0.))
+                .child(
+                    div()
+                        .id("dlg-form")
+                        .w(px(300.))
+                        .max_h(px(500.))
+                        .p(px(16.))
+                        .flex_col()
+                        .gap(px(10.))
+                        .overflow_y_scroll()
+                        .child(field_input("供应商名称", &inputs.name, cx))
                 .child(field_input("接口地址", &inputs.endpoint, cx))
                 .child(
                     div()
@@ -468,28 +621,35 @@ fn form_and_preview(
                         ),
                 )
                 .child(field_input("图标", &inputs.icon, cx))
-                .child(field_input("图标颜色", &inputs.icon_color, cx)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .border_l_1()
-                .border_color(theme::stroke_a(0.12))
-                .p(px(16.))
-                .flex_col()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(theme::text_faint())
-                        .child("配置预览（切换后写入客户端的关键字段）"),
+                .child(icon_picker(&inputs.icon, cx))
+                .child(field_input("图标颜色", &inputs.icon_color, cx))
+                .child(color_picker(&inputs.icon_color, cx)),
                 )
                 .child(
                     div()
-                        .font_family(theme::MONO_FONT)
-                        .text_size(px(10.))
-                        .text_color(theme::text_dim())
-                        .child(preview_text(preset, &live_fields)),
+                        .id("dlg-preview")
+                        .flex_1()
+                        .max_h(px(500.))
+                        .min_w(px(0.))
+                        .border_l_1()
+                        .border_color(theme::stroke_a(0.12))
+                        .p(px(16.))
+                        .flex_col()
+                        .gap(px(8.))
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme::text_faint())
+                                .child("配置预览（切换后写入客户端的关键字段）"),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme::MONO_FONT)
+                                .text_size(px(10.))
+                                .text_color(theme::text_dim())
+                                .child(preview_text(preset, &live_fields)),
+                        ),
                 ),
         )
         .child(
@@ -499,6 +659,8 @@ fn form_and_preview(
                 .flex()
                 .justify_end()
                 .gap(px(8.))
+                .border_t_1()
+                .border_color(theme::stroke_a(0.12))
                 .child(widgets::ghost_button("dlg-cancel", "取消").on_click(cx.listener(
                     |this, _, _, cx| request_close(this, cx),
                 )))

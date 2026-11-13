@@ -23,6 +23,8 @@ mod universal;
 mod update;
 mod single_instance;
 mod proxy_env;
+mod terminal;
+mod envcheck;
 
 use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size};
 

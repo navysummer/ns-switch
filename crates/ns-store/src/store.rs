@@ -164,6 +164,9 @@ pub struct Settings {
     /// 空/缺失 = 使用默认 `~/.<tool>`。对齐 cc-switch `DirectorySettings`。
     #[serde(default)]
     pub config_dirs: BTreeMap<String, String>,
+    /// 首选终端（空 = 平台默认）。对齐 cc-switch `TerminalSettings`。
+    #[serde(default)]
+    pub terminal: String,
 }
 
 impl Settings {
@@ -238,6 +241,11 @@ impl Settings {
             self.config_dirs.insert(tool.id_str().to_string(), trimmed.to_string());
         }
     }
+
+    /// 首选终端值（空 = 用平台默认；解释见 `ns-switch::terminal`）。
+    pub fn terminal(&self) -> &str {
+        self.terminal.trim()
+    }
 }
 
 impl Default for Settings {
@@ -256,6 +264,7 @@ impl Default for Settings {
             custom_pricing: BTreeMap::new(),
             global_proxy: None,
             config_dirs: BTreeMap::new(),
+            terminal: String::new(),
         }
     }
 }
@@ -482,14 +491,47 @@ impl Store {
     ///
     /// 备份内容必须是合法配置；否则报错且不改动现有配置。
     pub fn restore_manual_backup(&mut self, backup_path: &str) -> Result<()> {
-        let bytes = fs::read(backup_path)
-            .with_context(|| format!("读备份失败: {backup_path}"))?;
+        self.restore_from_file(Path::new(backup_path), "pre-restore")
+    }
+
+    /// 从外部文件导入配置（覆盖当前 `config.json`）。
+    ///
+    /// 校验：内容必须是合法配置，否则报错且不改动；导入前把当前配置
+    /// 备份到 `backups/pre-import/`，便于回退。
+    pub fn import_config_from(&mut self, path: &str) -> Result<()> {
+        let path = expand_path(path);
+        self.restore_from_file(&path, "pre-import")
+    }
+
+    /// 导出完整配置（供应商、当前选择、设置、项目、聚合、账号）到指定文件。
+    ///
+    /// 路径支持 `~` 前缀；父目录自动创建；返回实际写入路径。
+    pub fn export_config_to(&self, path: &str) -> Result<PathBuf> {
+        let path = expand_path(path);
+        if path.as_os_str().is_empty() {
+            bail!("导出路径为空");
+        }
+        if path.is_dir() {
+            bail!("导出路径是目录: {}", path.display());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("创建导出目录失败: {}", parent.display()))?;
+        }
+        atomic_write_json(&path, &self.config)?;
+        Ok(path)
+    }
+
+    /// 从文件恢复配置（内部：校验 → 备份当前 → 原子替换 → 重载）。
+    fn restore_from_file(&mut self, path: &Path, pre_dir: &str) -> Result<()> {
+        let display = path.display().to_string();
+        let bytes = fs::read(path).with_context(|| format!("读配置失败: {display}"))?;
         let text = String::from_utf8(bytes.clone())
-            .map_err(|e| anyhow::anyhow!("备份不是 UTF-8 文本: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("配置不是 UTF-8 文本: {e}"))?;
         serde_json::from_str::<Config>(&text)
-            .map_err(|e| anyhow::anyhow!("备份内容不是有效的配置: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("配置内容无效: {e}"))?;
         // 恢复前保留当前配置，便于回退。
-        let pre = self.backups_root().join("pre-restore");
+        let pre = self.backups_root().join(pre_dir);
         if self.config_path.exists() {
             fs::create_dir_all(&pre)?;
             let _ = fs::copy(
@@ -926,6 +968,12 @@ impl Store {
     /// 设置某工具配置目录覆盖（保存；空 = 恢复默认）。
     pub fn set_config_dir(&mut self, tool: Tool, dir: &str) -> Result<()> {
         self.config.settings.set_config_dir(tool, dir);
+        self.save()
+    }
+
+    /// 设置首选终端（保存；空 = 平台默认）。
+    pub fn set_terminal(&mut self, terminal: &str) -> Result<()> {
+        self.config.settings.terminal = terminal.trim().to_string();
         self.save()
     }
 
@@ -1404,6 +1452,21 @@ fn s3_region(_endpoint: &str) -> String {
     "us-east-1".to_string()
 }
 
+/// 展开路径开头的 `~`（当前用户 HOME）；其余原样。
+fn expand_path(path: &str) -> PathBuf {
+    let trimmed = path.trim();
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if trimmed == "~" {
+        return home().unwrap_or_else(|| PathBuf::from("~"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(h) = home() {
+            return h.join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
 /// 默认数据目录。
 pub fn default_data_dir() -> PathBuf {
     if let Some(env) = std::env::var_os("NS_SWITCH_HOME") {
@@ -1844,6 +1907,55 @@ mod tests {
     }
 
     #[test]
+    fn export_and_import_config_roundtrip() {
+        let dir = test_dir();
+        {
+            let mut store = Store::open_at(dir.clone()).unwrap();
+            store.add_provider(sample_provider("p1")).unwrap();
+            store.add_provider(sample_provider("p2")).unwrap();
+            store.set_terminal("iterm2").unwrap();
+            let out = dir.join("exported").join("config-export.json");
+            let written = store
+                .export_config_to(out.to_str().unwrap())
+                .unwrap();
+            assert_eq!(written, out);
+            assert!(out.exists(), "导出文件应落盘");
+            // 导出内容包含供应商与设置。
+            let text = fs::read_to_string(&out).unwrap();
+            assert!(text.contains("\"p1\""));
+            assert!(text.contains("iterm2"));
+            // 改动后导入 → 回到导出时状态。
+            store.remove_provider("p2").unwrap();
+            assert_eq!(store.config().providers.len(), 1);
+            store.import_config_from(out.to_str().unwrap()).unwrap();
+            assert_eq!(store.config().providers.len(), 2);
+            assert_eq!(store.config().settings.terminal(), "iterm2");
+            // 导入前快照保留被覆盖的配置。
+            assert!(store.backups_root().join("pre-import").exists());
+            // 非法内容被拒绝且不改动配置。
+            let bad = dir.join("bad-import.json");
+            fs::write(&bad, "{\"providers\": 1}").unwrap();
+            assert!(store.import_config_from(bad.to_str().unwrap()).is_err());
+            assert_eq!(store.config().providers.len(), 2);
+            // 导出到目录路径报错。
+            assert!(store.export_config_to(dir.to_str().unwrap()).is_err());
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn expand_path_expands_home_prefix() {
+        let home = std::env::var_os("HOME").expect("测试需要 HOME");
+        let expanded = super::expand_path("~/ns-switch/export.json");
+        assert_eq!(expanded, std::path::PathBuf::from(home).join("ns-switch/export.json"));
+        // 无 `~` 前缀原样保留。
+        assert_eq!(
+            super::expand_path("/tmp/x.json"),
+            std::path::PathBuf::from("/tmp/x.json")
+        );
+    }
+
+    #[test]
     fn sync_config_roundtrip() {
         let dir = test_dir();
         {
@@ -2047,6 +2159,23 @@ mod tests {
         );
         assert_eq!(store.config().settings.config_dir_for(Tool::Codex), None);
         assert_eq!(store.config().settings.config_dir_for(Tool::Gemini), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn terminal_roundtrip() {
+        let dir = test_dir();
+        {
+            let mut store = Store::open_at(dir.clone()).unwrap();
+            assert_eq!(store.config().settings.terminal(), "");
+            store.set_terminal("iterm2").unwrap();
+        }
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(store.config().settings.terminal(), "iterm2");
+        // 空值 = 平台默认。
+        let mut store = store;
+        store.set_terminal("").unwrap();
+        assert_eq!(store.config().settings.terminal(), "");
         let _ = fs::remove_dir_all(dir);
     }
 
